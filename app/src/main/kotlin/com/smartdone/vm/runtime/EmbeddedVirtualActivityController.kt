@@ -9,10 +9,15 @@ import android.content.pm.ActivityInfo
 import android.os.Bundle
 import android.os.IBinder
 import android.util.Log
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.LayoutInflater
+import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.smartdone.vm.core.virtual.EvokeCore
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntime
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntimeSession
@@ -199,25 +204,35 @@ internal class EmbeddedVirtualActivityController(
         (decorView.parent as? ViewGroup)?.removeView(decorView)
         val content = hostActivity.findViewById<ViewGroup>(android.R.id.content)
         content.removeAllViews()
-        if (decorView is ViewGroup) {
-            content.addView(
-                decorView,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            )
-        } else {
-            content.addView(
-                decorView,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            )
-        }
+        WindowCompat.setDecorFitsSystemWindows(hostActivity.window, true)
+        content.addView(createInsetAwareContainer(decorView))
         hostActivity.title = activity.title
     }
+
+    private fun createInsetAwareContainer(embeddedDecorView: View): ViewGroup =
+        FrameLayout(hostActivity).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            clipToPadding = false
+            addView(
+                embeddedDecorView,
+                FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    Gravity.TOP or Gravity.START
+                )
+            )
+            ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
+                val bars = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+                )
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+                insets
+            }
+            requestApplyInsets()
+        }
 
     private fun applyEmbeddedTheme(activity: Activity, themeResId: Int) {
         if (themeResId != 0) {

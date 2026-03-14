@@ -89,26 +89,26 @@
                 android:resource="@xml/file_paths" />
         </provider>
 
-        <activity android:name=".stub.StubActivity_P0_A0" android:exported="false" android:process=":p0" />
-        <activity android:name=".stub.StubActivity_P0_A1" android:exported="false" android:process=":p0" />
-        <activity android:name=".stub.StubActivity_P1_A0" android:exported="false" android:process=":p1" />
-        <activity android:name=".stub.StubActivity_P1_A1" android:exported="false" android:process=":p1" />
-        <activity android:name=".stub.StubActivity_P2_A0" android:exported="false" android:process=":p2" />
-        <activity android:name=".stub.StubActivity_P2_A1" android:exported="false" android:process=":p2" />
-        <activity android:name=".stub.StubActivity_P3_A0" android:exported="false" android:process=":p3" />
-        <activity android:name=".stub.StubActivity_P3_A1" android:exported="false" android:process=":p3" />
-        <activity android:name=".stub.StubActivity_P4_A0" android:exported="false" android:process=":p4" />
-        <activity android:name=".stub.StubActivity_P4_A1" android:exported="false" android:process=":p4" />
-        <activity android:name=".stub.StubActivity_P5_A0" android:exported="false" android:process=":p5" />
-        <activity android:name=".stub.StubActivity_P5_A1" android:exported="false" android:process=":p5" />
-        <activity android:name=".stub.StubActivity_P6_A0" android:exported="false" android:process=":p6" />
-        <activity android:name=".stub.StubActivity_P6_A1" android:exported="false" android:process=":p6" />
-        <activity android:name=".stub.StubActivity_P7_A0" android:exported="false" android:process=":p7" />
-        <activity android:name=".stub.StubActivity_P7_A1" android:exported="false" android:process=":p7" />
-        <activity android:name=".stub.StubActivity_P8_A0" android:exported="false" android:process=":p8" />
-        <activity android:name=".stub.StubActivity_P8_A1" android:exported="false" android:process=":p8" />
-        <activity android:name=".stub.StubActivity_P9_A0" android:exported="false" android:process=":p9" />
-        <activity android:name=".stub.StubActivity_P9_A1" android:exported="false" android:process=":p9" />
+        <activity android:name=".stub.StubActivity_P0_A0" android:exported="false" android:process=":p0" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P0_A1" android:exported="false" android:process=":p0" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P1_A0" android:exported="false" android:process=":p1" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P1_A1" android:exported="false" android:process=":p1" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P2_A0" android:exported="false" android:process=":p2" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P2_A1" android:exported="false" android:process=":p2" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P3_A0" android:exported="false" android:process=":p3" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P3_A1" android:exported="false" android:process=":p3" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P4_A0" android:exported="false" android:process=":p4" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P4_A1" android:exported="false" android:process=":p4" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P5_A0" android:exported="false" android:process=":p5" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P5_A1" android:exported="false" android:process=":p5" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P6_A0" android:exported="false" android:process=":p6" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P6_A1" android:exported="false" android:process=":p6" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P7_A0" android:exported="false" android:process=":p7" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P7_A1" android:exported="false" android:process=":p7" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P8_A0" android:exported="false" android:process=":p8" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P8_A1" android:exported="false" android:process=":p8" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P9_A0" android:exported="false" android:process=":p9" android:theme="@style/Theme.Vm.EmbeddedHost" />
+        <activity android:name=".stub.StubActivity_P9_A1" android:exported="false" android:process=":p9" android:theme="@style/Theme.Vm.EmbeddedHost" />
 
         <service android:name=".stub.StubService_P0" android:exported="false" android:process=":p0" />
         <service android:name=".stub.StubService_P1" android:exported="false" android:process=":p1" />

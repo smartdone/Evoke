@@ -12,9 +12,9 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddCircleOutline
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -35,6 +35,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -72,14 +73,12 @@ fun HomeScreen(
             }
         }
     } else {
-        LazyVerticalGrid(
-            columns = GridCells.Adaptive(220.dp),
+        LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+            item {
                 FilledTonalButton(onClick = { showAddSheet = true }) {
                     Icon(Icons.Outlined.AddCircleOutline, contentDescription = null)
                     Text("添加应用")
@@ -97,38 +96,58 @@ fun HomeScreen(
                         containerColor = MaterialTheme.colorScheme.surface
                     )
                 ) {
-                    Column(
+                    Row(
                         modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                        horizontalArrangement = Arrangement.spacedBy(16.dp),
+                        verticalAlignment = Alignment.Top
                     ) {
                         AsyncImage(
                             model = group.app.iconPath,
                             contentDescription = null,
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.size(56.dp),
+                            contentScale = ContentScale.Fit
                         )
-                        Text(group.app.label, style = MaterialTheme.typography.titleMedium)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("v${group.app.versionCode}", style = MaterialTheme.typography.bodySmall)
-                            Text("${group.instances.size} 个实例", style = MaterialTheme.typography.bodySmall)
-                        }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { viewModel.launch(group.app.packageName) }) {
-                                Icon(Icons.Outlined.PlayArrow, contentDescription = null)
-                                Text("启动默认")
-                            }
-                            if (group.app.isRunning) {
-                                OutlinedButton(onClick = { viewModel.stop(group.app.packageName) }) {
-                                    Icon(Icons.Outlined.Stop, contentDescription = null)
-                                    Text("停止默认")
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(group.app.label, style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    group.app.packageName,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(
+                                        "v${group.app.versionCode}",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        "${group.instances.size} 个实例",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
                                 }
                             }
-                        }
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            group.instances.forEach { instance ->
-                                AssistChip(
-                                    onClick = { viewModel.launch(group.app.packageName, instance.userId) },
-                                    label = { Text("${instance.displayName} · user ${instance.userId}") }
-                                )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { viewModel.launch(group.app.packageName) }) {
+                                    Icon(Icons.Outlined.PlayArrow, contentDescription = null)
+                                    Text("启动")
+                                }
+                                if (group.app.isRunning) {
+                                    OutlinedButton(onClick = { viewModel.stop(group.app.packageName) }) {
+                                        Icon(Icons.Outlined.Stop, contentDescription = null)
+                                        Text("停止")
+                                    }
+                                }
+                            }
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                group.instances.forEach { instance ->
+                                    AssistChip(
+                                        onClick = { viewModel.launch(group.app.packageName, instance.userId) },
+                                        label = { Text("${instance.displayName} · user ${instance.userId}") }
+                                    )
+                                }
                             }
                         }
                     }

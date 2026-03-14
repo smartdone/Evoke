@@ -6,6 +6,7 @@ import android.os.Process
 import android.util.Log
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.core.view.WindowCompat
 import com.smartdone.vm.core.virtual.EvokeCore
 import com.smartdone.vm.core.virtual.client.RuntimeBootstrapResult
 import com.smartdone.vm.core.virtual.client.EvokeAppClient
@@ -41,6 +42,7 @@ open class BaseStubActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        configureHostWindow()
         val launchRecord = StubActivityRouter.read(intent, javaClass.name)
         val evokeAppClient = entryPoint().evokeAppClient()
         if (evokeAppClient.currentPackageName() != launchRecord.packageName) {
@@ -215,6 +217,10 @@ open class BaseStubActivity : ComponentActivity() {
                 append(message)
             }
         }
+
+    private fun configureHostWindow() {
+        WindowCompat.setDecorFitsSystemWindows(window, true)
+    }
 
     private fun setFailureContent(
         launchRecord: com.smartdone.vm.core.virtual.util.StubActivityRecord,

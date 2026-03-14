@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Android
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
@@ -75,7 +76,7 @@ fun InstallScreen(
         floatingActionButton = {
             if (selectedTab == 1) {
                 FloatingActionButton(onClick = { launcher.launch("application/vnd.android.package-archive") }) {
-                    Text("选取 APK")
+                    Icon(Icons.Outlined.Add, contentDescription = "选取 APK")
                 }
             }
         }
