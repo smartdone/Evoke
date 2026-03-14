@@ -3,6 +3,7 @@ package com.smartdone.vm.ui.install
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.smartdone.vm.core.virtual.EvokeCore
 import com.smartdone.vm.core.virtual.install.ApkInstaller
 import com.smartdone.vm.core.virtual.install.InstalledAppScanner
 import com.smartdone.vm.core.virtual.model.InstallProgress
@@ -19,7 +20,8 @@ import kotlinx.coroutines.launch
 @HiltViewModel
 class InstallViewModel @Inject constructor(
     private val installedAppScanner: InstalledAppScanner,
-    private val apkInstaller: ApkInstaller
+    private val apkInstaller: ApkInstaller,
+    private val evokeCore: EvokeCore
 ) : ViewModel() {
     private val _state = MutableStateFlow(InstallUiState())
     val state: StateFlow<InstallUiState> = _state.asStateFlow()
@@ -102,6 +104,23 @@ class InstallViewModel @Inject constructor(
                 refreshInstalledApps()
             }.onFailure { throwable ->
                 _state.update { it.copy(lastNotice = throwable.message ?: "APK 导入失败") }
+            }
+        }
+    }
+
+    fun launchFromUri(uri: Uri) {
+        installJob?.cancel()
+        dismissPendingInstall()
+        _progress.value = null
+        installJob = viewModelScope.launch {
+            runCatching {
+                evokeCore.launchApkUri(uri)
+            }.onSuccess { launched ->
+                _state.update {
+                    it.copy(lastNotice = if (launched) "APK 已直接启动" else "APK 缺少可启动 Activity")
+                }
+            }.onFailure { throwable ->
+                _state.update { it.copy(lastNotice = throwable.message ?: "APK 直接启动失败") }
             }
         }
     }
