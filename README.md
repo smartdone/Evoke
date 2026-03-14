@@ -2,6 +2,8 @@
 
 Evoke is an Android app container that imports APKs into a host-managed sandbox and launches them through isolated stub processes.
 
+This project was developed with Codex GPT-5.4.
+
 ## What It Does
 
 - Imports installed apps or local APK files into an internal managed space
