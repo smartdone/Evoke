@@ -81,3 +81,7 @@ core-native/    Native runtime bridge and I/O redirection
 ## Status
 
 This project is experimental and focused on container runtime behavior, process bootstrapping, app import, and intent routing on modern Android.
+
+## Compatibility
+
+At this stage, Evoke has only been verified to work on Android 16. Other Android versions have not been tested yet.

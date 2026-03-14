@@ -81,3 +81,7 @@ core-native/    Native 运行时桥接与 I/O 重定向
 ## 当前状态
 
 该项目当前主要聚焦于现代 Android 上的容器运行时能力，包括应用导入、进程引导、Intent 路由和宿主侧运行控制。
+
+## 兼容性说明
+
+目前 Evoke 仅在 Android 16 上验证可以正常工作，其他 Android 版本暂未测试。
