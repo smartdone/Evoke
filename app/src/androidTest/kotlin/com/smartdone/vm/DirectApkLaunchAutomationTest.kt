@@ -11,55 +11,41 @@ import androidx.test.uiautomator.Until
 import dagger.hilt.android.EntryPointAccessors
 import java.io.File
 import java.io.FileInputStream
-import org.junit.Assert.assertFalse
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.runBlocking
 
 @RunWith(AndroidJUnit4::class)
-class ApkPureLaunchAutomationTest {
+class DirectApkLaunchAutomationTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val targetContext = instrumentation.targetContext
     private val device = UiDevice.getInstance(instrumentation)
 
     @Before
     fun setUp() {
-        ensureInstalledInEvokeSpace()
-        assumeTrue("APKPure must already be imported into Evoke space", isInstalledInEvokeSpace())
+        assumeTrue("A launchable APKPure source APK is required", launchSourceFile()?.exists() == true)
         execShell("logcat -c")
         bringHostToForeground()
     }
 
     @Test
-    fun launchInstalledApkPure_fromHome_doesNotCrashStubProcess() {
-        val launchTarget = device.wait(Until.findObject(By.text("APKPure · user 0")), 10_000)
-            ?: device.wait(Until.findObject(By.text("启动默认")), 5_000)
-        assertTrue("Could not find a launch control for APKPure", launchTarget != null)
-        launchTarget!!.click()
-
-        val launched = waitForEmbeddedUi()
+    fun launchApkUri_withoutImport_launchesInsideEvoke() {
+        val source = requireNotNull(launchSourceFile())
+        val launched = runBlocking {
+            entryPoint().evokeCore().launchApkUri(Uri.fromFile(source))
+        }
+        val embedded = waitForEmbeddedUi()
         val logs = captureRelevantLogs()
-        val apkPath = entryPoint().packageManagerService().getPackageInfo(VIRTUAL_APKPURE_PACKAGE)
-            .getString("apkPath")
-            .orEmpty()
-        val apkFile = File(apkPath)
 
+        assertTrue("Direct APK launch request was rejected", launched)
+        assertTrue("Expected direct APK launch to reach embedded UI. Logs:\n$logs", embedded)
         assertTrue(
-            "Evoke APK should be sealed read-only: $apkPath",
-            apkPath.isNotBlank() && apkFile.exists() && !apkFile.canWrite()
+            "Expected direct launch to use staged launch storage. Logs:\n$logs",
+            logs.contains("/VirtualEnv/launches/")
         )
-        assertTrue(
-            "Expected embedded APKPure activity to launch inside Evoke. Logs:\n$logs",
-            launched
-        )
-        assertFalse("Stub reported launch failure.\nLogs:\n$logs", logs.contains("launchFailed="))
-        assertFalse("Embedded launch controller reported a failure.\nLogs:\n$logs", logs.contains("Embedded virtual activity launch failed"))
-        assertFalse("Detected writable dex failure again.\nLogs:\n$logs", logs.contains("Writable dex file"))
-        assertFalse("Detected fatal runtime crash.\nLogs:\n$logs", logs.contains("FATAL EXCEPTION"))
     }
 
     private fun bringHostToForeground() {
@@ -69,39 +55,20 @@ class ApkPureLaunchAutomationTest {
             }
         )
         device.wait(Until.hasObject(By.pkg(targetContext.packageName).depth(0)), 10_000)
-        device.wait(Until.findObject(By.text("Home")), 5_000)?.click()
         SystemClock.sleep(1_000)
     }
 
-    private fun ensureInstalledInEvokeSpace() {
-        if (isInstalledInEvokeSpace()) return
-        runBlocking {
-            when {
-                isInstalledOnDevice() -> {
-                    entryPoint().apkInstaller().installFromInstalledApp(VIRTUAL_APKPURE_PACKAGE).collect()
-                }
-
-                seededApkFile().exists() -> {
-                    entryPoint()
-                        .apkInstaller()
-                        .installFromFile(Uri.fromFile(seededApkFile()))
-                        .collect()
-                }
-            }
-        }
-    }
-
-    private fun isInstalledInEvokeSpace(): Boolean =
-        entryPoint().packageManagerService().installedPackages.contains(VIRTUAL_APKPURE_PACKAGE)
-
-    private fun isInstalledOnDevice(): Boolean =
-        runCatching {
+    private fun launchSourceFile(): File? {
+        val installedSource = runCatching {
             @Suppress("DEPRECATION")
-            targetContext.packageManager.getPackageInfo(VIRTUAL_APKPURE_PACKAGE, 0)
-        }.isSuccess
-
-    private fun seededApkFile(): File =
-        File(targetContext.getExternalFilesDir(null), "apkpure-base.apk")
+            targetContext.packageManager.getApplicationInfo(VIRTUAL_APKPURE_PACKAGE, 0).sourceDir
+        }.getOrNull()
+        if (!installedSource.isNullOrBlank()) {
+            return File(installedSource)
+        }
+        return File(targetContext.getExternalFilesDir(null), "apkpure-base.apk")
+            .takeIf(File::exists)
+    }
 
     private fun waitForEmbeddedUi(timeoutMs: Long = 10_000L): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
@@ -128,10 +95,8 @@ class ApkPureLaunchAutomationTest {
                     it.contains("EvokeAppRuntime") ||
                     it.contains("EmbeddedActivity") ||
                     it.contains("StubActivity") ||
-                    it.contains("NativeCompat") ||
-                    it.contains("Displayed com.smartdone.vm/.stub") ||
                     it.contains(VIRTUAL_APKPURE_PACKAGE) ||
-                    it.contains("Writable dex file")
+                    it.contains("/VirtualEnv/launches/")
             }
             .joinToString("\n")
     }

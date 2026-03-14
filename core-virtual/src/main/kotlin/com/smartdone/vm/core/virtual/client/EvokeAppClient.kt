@@ -10,6 +10,7 @@ import com.smartdone.vm.core.virtual.client.hook.ContentProviderHook
 import com.smartdone.vm.core.virtual.client.hook.ContextHook
 import com.smartdone.vm.core.virtual.client.hook.DeviceInfoHook
 import com.smartdone.vm.core.virtual.client.hook.PackageManagerHook
+import com.smartdone.vm.core.virtual.client.hook.VirtualPackageArchiveResolver
 import com.smartdone.vm.core.virtual.server.EvokeServiceFetcher
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -24,14 +25,21 @@ class EvokeAppClient @Inject constructor(
     private val contextHook: ContextHook,
     private val permissionHook: PermissionHook,
     private val deviceInfoHook: DeviceInfoHook,
+    private val virtualPackageArchiveResolver: VirtualPackageArchiveResolver,
     private val serviceFetcher: EvokeServiceFetcher
 ) {
     private var initializedPackage: String? = null
 
-    fun initialize(context: Context, packageName: String, userId: Int) {
+    fun initialize(
+        context: Context,
+        packageName: String,
+        userId: Int,
+        apkPathOverride: String? = null
+    ) {
         initializedPackage = packageName
-        binderProxyManager.install(context.packageName)
-        activityManagerHook.install(context, packageName)
+        virtualPackageArchiveResolver.prepare(packageName, userId, apkPathOverride)
+        binderProxyManager.install(context.packageName, context.packageManager)
+        activityManagerHook.install(context, packageName, userId)
         packageManagerHook.install(packageName)
         contentProviderHook.install(context, userId)
         broadcastHook.install(packageName)

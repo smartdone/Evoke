@@ -97,6 +97,17 @@ data class InstallResult(
     val label: String
 )
 
+data class StagedLaunchLayout(
+    val packageName: String,
+    val label: String,
+    val baseApkPath: String,
+    val splitApkPaths: List<String>,
+    val launcherActivity: String?,
+    val applicationClassName: String?,
+    val nativeLibDir: String,
+    val optimizedDir: String
+)
+
 data class EvokeAppSummary(
     val packageName: String,
     val label: String,

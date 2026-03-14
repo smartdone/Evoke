@@ -140,13 +140,18 @@ fun InstallScreen(
             title = { Text("导入本地 APK") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("将从以下 URI 读取 APK 并导入 Evoke 空间：")
+                    Text("可以直接在 Evoke 内临时启动，或导入后长期保留。")
                     Text(pendingInstall.uri.toString())
                 }
             },
             confirmButton = {
-                TextButton(onClick = { viewModel.installFromUri(pendingInstall.uri) }) {
-                    Text("开始导入")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { viewModel.launchFromUri(pendingInstall.uri) }) {
+                        Text("直接启动")
+                    }
+                    TextButton(onClick = { viewModel.installFromUri(pendingInstall.uri) }) {
+                        Text("导入保存")
+                    }
                 }
             },
             dismissButton = {
@@ -228,7 +233,7 @@ private fun LocalApkTab() {
         modifier = Modifier.padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Text("选择本地 APK 后会进入统一安装管线。")
-        Text("支持通过 Storage Access Framework 选择本地 APK 文件。")
+        Text("选择本地 APK 后可以直接临时启动，也可以导入到 Evoke 空间。")
+        Text("直接启动不会安装到 Android 系统，也不会写入 Evoke 应用列表。")
     }
 }

@@ -6,14 +6,17 @@ import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.smartdone.vm.core.virtual.data.EvokeAppRepository
+import com.smartdone.vm.core.virtual.install.ApkFileImporter
 import com.smartdone.vm.core.virtual.model.RunningAppRecord
 import com.smartdone.vm.core.virtual.permission.PermissionRequestContract
 import com.smartdone.vm.core.virtual.model.StorageStats
 import com.smartdone.vm.core.virtual.server.PermissionDelegateService
 import com.smartdone.vm.core.virtual.server.ProcessSlotManager
+import com.smartdone.vm.core.virtual.settings.EvokeSettingsRepository
 import com.smartdone.vm.core.virtual.server.EvokeActivityManagerService
 import com.smartdone.vm.core.virtual.server.EvokeBroadcastManager
 import com.smartdone.vm.core.virtual.server.EvokeContentProviderManager
@@ -32,13 +35,15 @@ import kotlinx.coroutines.flow.asStateFlow
 class EvokeCore @Inject constructor(
     private val context: Context,
     private val repository: EvokeAppRepository,
+    private val apkFileImporter: ApkFileImporter,
     private val packageManagerService: EvokePackageManagerService,
     private val activityManagerService: EvokeActivityManagerService,
     private val permissionDelegateService: PermissionDelegateService,
     private val broadcastManager: EvokeBroadcastManager,
     private val contentProviderManager: EvokeContentProviderManager,
     private val processSlotManager: ProcessSlotManager,
-    private val sandboxPath: SandboxPath
+    private val sandboxPath: SandboxPath,
+    private val settingsRepository: EvokeSettingsRepository
 ) {
     private val runningAppsState = MutableStateFlow<List<RunningAppRecord>>(emptyList())
 
@@ -50,6 +55,44 @@ class EvokeCore @Inject constructor(
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
         return launchIntent(routeIntent, userId)
+    }
+
+    suspend fun launchApkUri(uri: Uri, userId: Int = 0): Boolean {
+        val stagedLaunch = apkFileImporter.stageForLaunch(uri)
+        val targetActivity = stagedLaunch.launcherActivity ?: return false
+        val launchInfo = activityManagerService.startActivity(
+            packageName = stagedLaunch.packageName,
+            userId = userId,
+            activityName = targetActivity
+        )
+        val slotId = launchInfo.getInt("slotId")
+        val stubClass = "com.smartdone.vm.stub.StubActivity_P${slotId}_A0"
+        val record = StubActivityRecord(
+            stubClassName = stubClass,
+            packageName = stagedLaunch.packageName,
+            userId = userId,
+            realIntent = Intent(Intent.ACTION_MAIN).apply {
+                setClassName(stagedLaunch.packageName, targetActivity)
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                putExtra(EXTRA_PACKAGE_NAME, stagedLaunch.packageName)
+                putExtra(EXTRA_USER_ID, userId)
+            },
+            apkPath = stagedLaunch.baseApkPath,
+            launcherActivity = targetActivity,
+            applicationClassName = stagedLaunch.applicationClassName,
+            nativeLibDir = stagedLaunch.nativeLibDir,
+            optimizedDir = stagedLaunch.optimizedDir
+        )
+        val stubIntent = StubActivityRouter.buildLaunchIntent(
+            hostPackage = context.packageName,
+            stubClassName = stubClass,
+            record = record,
+            label = stagedLaunch.label
+        )
+        context.startActivity(stubIntent)
+        syncRunningApps()
+        syncRunningNotification()
+        return true
     }
 
     suspend fun launchIntent(intent: Intent, userId: Int): Boolean {
@@ -246,6 +289,7 @@ class EvokeCore @Inject constructor(
     }
 
     private suspend fun syncPackageRunningState(packageName: String) {
+        if (repository.getApp(packageName) == null) return
         val isRunning = runningAppsState.value.any { it.packageName == packageName }
         repository.setRunning(packageName, isRunning)
     }
@@ -253,7 +297,7 @@ class EvokeCore @Inject constructor(
     private fun syncRunningNotification() {
         val runningApps = runningAppsState.value
         val notificationManager = NotificationManagerCompat.from(context)
-        if (runningApps.isEmpty()) {
+        if (!settingsRepository.currentSettings().showRunningAppsNotification || runningApps.isEmpty()) {
             notificationManager.cancel(RUNNING_APPS_NOTIFICATION_ID)
             return
         }
@@ -298,6 +342,10 @@ class EvokeCore @Inject constructor(
             NotificationManager.IMPORTANCE_LOW
         )
         manager.createNotificationChannel(channel)
+    }
+
+    fun refreshRunningAppsNotification() {
+        syncRunningNotification()
     }
 
     companion object {

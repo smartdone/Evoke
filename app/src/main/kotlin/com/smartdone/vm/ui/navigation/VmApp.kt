@@ -5,6 +5,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavType
+import androidx.navigation.NavHostController
+import androidx.navigation.NavDestination
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
@@ -18,35 +20,29 @@ import com.smartdone.vm.ui.running.RunningAppsScreen
 import com.smartdone.vm.ui.settings.SettingsScreen
 
 @Composable
-fun VmApp() {
+fun VmApp(startDestination: String = Destination.Home.route) {
     val navController = rememberNavController()
     val backStack = navController.currentBackStackEntryAsState()
-    val currentRoute = backStack.value?.destination
+    val currentDestination = backStack.value?.destination
 
     Scaffold(
         bottomBar = {
             BottomNavigationBar(
-                currentDestination = currentRoute?.route,
+                currentDestination = currentDestination?.route,
                 onNavigate = { destination ->
-                    navController.navigate(destination.route) {
-                        launchSingleTop = true
-                        restoreState = true
-                        popUpTo(navController.graph.startDestinationId) {
-                            saveState = true
-                        }
-                    }
+                    navController.navigateToTopLevel(destination)
                 }
             )
         }
     ) { padding ->
         NavHost(
             navController = navController,
-            startDestination = Destination.Home.route,
+            startDestination = startDestination,
             modifier = Modifier.padding(padding)
         ) {
             composable(Destination.Home.route) {
                 HomeScreen(
-                    onAddAppClick = { tab -> navController.navigate(Destination.installRoute(tab)) },
+                    onAddAppClick = { tab -> navController.navigateToInstall(tab) },
                     onAppClick = { pkgName -> navController.navigate(Destination.detailRoute(pkgName)) }
                 )
             }
@@ -76,6 +72,40 @@ fun VmApp() {
     }
 }
 
+private fun NavHostController.navigateToTopLevel(destination: Destination) {
+    if (destination.matches(currentDestination)) {
+        return
+    }
+    if (popBackStack(destination.route, inclusive = false) && destination.matches(currentDestination)) {
+        return
+    }
+    navigate(destination.route) {
+        launchSingleTop = true
+        restoreState = true
+        popUpTo(graph.startDestinationId) {
+            saveState = true
+        }
+    }
+}
+
+private fun NavHostController.navigateToInstall(tab: Int) {
+    val route = Destination.installRoute(tab)
+    if (currentDestination?.route == Destination.Install.pattern) {
+        navigate(route) {
+            launchSingleTop = true
+            restoreState = false
+        }
+        return
+    }
+    navigate(route) {
+        launchSingleTop = true
+        restoreState = true
+        popUpTo(graph.startDestinationId) {
+            saveState = true
+        }
+    }
+}
+
 sealed class Destination(val route: String) {
     data object Home : Destination("home")
     data object Install : Destination("install/0") {
@@ -92,5 +122,13 @@ sealed class Destination(val route: String) {
     companion object {
         fun detailRoute(packageName: String) = "detail/$packageName"
         fun installRoute(tab: Int) = "install/$tab"
+    }
+}
+
+private fun Destination.matches(destination: NavDestination?): Boolean {
+    val route = destination?.route ?: return false
+    return when (this) {
+        Destination.Install -> route == Destination.Install.pattern || route.startsWith("install/")
+        else -> route == this.route
     }
 }

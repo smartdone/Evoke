@@ -5,9 +5,11 @@ import android.content.Context
 import android.net.Uri
 import com.smartdone.vm.core.virtual.model.CopiedAppLayout
 import com.smartdone.vm.core.virtual.model.CopyEvent
+import com.smartdone.vm.core.virtual.model.StagedLaunchLayout
 import com.smartdone.vm.core.virtual.sandbox.SandboxPath
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.io.File
+import java.util.zip.ZipFile
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.Flow
@@ -32,7 +34,13 @@ class ApkFileImporter @Inject constructor(
         sandboxPath.ensureAppStructure(metadata.packageName)
         val target = sandboxPath.apkPath(metadata.packageName)
         tempFile.copyTo(target, overwrite = true)
+        val splitTargets = copyRelatedSplitApks(
+            sourceUri = uri,
+            packageName = metadata.packageName,
+            splitTargetDir = sandboxPath.splitDir(metadata.packageName)
+        )
         sandboxPath.sealArchiveIfManaged(target.absolutePath)
+        extractNativeLibraries(target, sandboxPath.nativeLibDir(metadata.packageName))
         tempFile.delete()
         emit(
             CopyEvent.Completed(
@@ -40,10 +48,84 @@ class ApkFileImporter @Inject constructor(
                     packageName = metadata.packageName,
                     appDir = sandboxPath.appDir(metadata.packageName).absolutePath,
                     baseApkPath = target.absolutePath,
-                    splitApkPaths = emptyList(),
+                    splitApkPaths = splitTargets,
                     nativeLibDirs = emptyList()
                 )
             )
         )
+    }
+
+    suspend fun stageForLaunch(uri: Uri): StagedLaunchLayout {
+        val tempFile = File(sandboxPath.tempImportDir(), "launch_${System.currentTimeMillis()}.apk")
+        context.contentResolver.openInputStream(uri)?.use { input ->
+            tempFile.outputStream().use { output -> input.copyTo(output) }
+        } ?: error("Unable to open APK uri: $uri")
+
+        val metadata = apkParser.parseArchive(tempFile.absolutePath)
+            ?: error("Unable to parse APK: $uri")
+        sandboxPath.ensureAppStructure(metadata.packageName)
+        val launchId = System.currentTimeMillis().toString()
+        val target = sandboxPath.stagedLaunchApkPath(metadata.packageName, launchId)
+        tempFile.copyTo(target, overwrite = true)
+        val splitTargets = copyRelatedSplitApks(
+            sourceUri = uri,
+            packageName = metadata.packageName,
+            splitTargetDir = sandboxPath.stagedLaunchSplitDir(metadata.packageName, launchId)
+        )
+        sandboxPath.sealStandaloneArchive(target)
+        val nativeLibDir = sandboxPath.stagedLaunchNativeLibDir(metadata.packageName, launchId)
+        extractNativeLibraries(target, nativeLibDir)
+        tempFile.delete()
+        return StagedLaunchLayout(
+            packageName = metadata.packageName,
+            label = metadata.label.ifBlank { metadata.packageName },
+            baseApkPath = target.absolutePath,
+            splitApkPaths = splitTargets,
+            launcherActivity = metadata.launcherActivity ?: metadata.activities.firstOrNull(),
+            applicationClassName = metadata.applicationClassName,
+            nativeLibDir = nativeLibDir.absolutePath,
+            optimizedDir = sandboxPath.stagedLaunchOptimizedDir(metadata.packageName, launchId).absolutePath
+        )
+    }
+
+    private fun extractNativeLibraries(apkFile: File, targetDir: File) {
+        ZipFile(apkFile).use { zip ->
+            zip.entries().asSequence()
+                .filter { !it.isDirectory && it.name.startsWith("lib/") && it.name.endsWith(".so") }
+                .forEach { entry ->
+                    val target = File(targetDir, File(entry.name).name)
+                    zip.getInputStream(entry).use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+        }
+    }
+
+    private fun copyRelatedSplitApks(
+        sourceUri: Uri,
+        packageName: String,
+        splitTargetDir: File
+    ): List<String> {
+        val sourceFile = sourceUri.path
+            ?.takeIf { sourceUri.scheme == ContentResolver.SCHEME_FILE }
+            ?.let(::File)
+            ?.takeIf(File::exists)
+            ?: return emptyList()
+        return sourceFile.parentFile
+            ?.listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter { it.isFile && it.extension == "apk" && it.name != sourceFile.name }
+            .filter { candidate ->
+                apkParser.parseArchive(candidate.absolutePath)?.packageName == packageName
+            }
+            .sortedBy(File::getName)
+            .map { splitFile ->
+                val target = File(splitTargetDir, splitFile.name)
+                splitFile.copyTo(target, overwrite = true)
+                sandboxPath.sealStandaloneArchive(target)
+                target.absolutePath
+            }
+            .toList()
     }
 }

@@ -10,6 +10,7 @@ import com.smartdone.vm.core.virtual.install.ApkParser
 import com.smartdone.vm.core.virtual.install.AppCopier
 import com.smartdone.vm.core.virtual.install.InstalledAppScanner
 import com.smartdone.vm.core.virtual.sandbox.SandboxPath
+import com.smartdone.vm.core.virtual.settings.EvokeSettingsRepository
 import com.smartdone.vm.core.virtual.server.PermissionDelegateService
 import com.smartdone.vm.core.virtual.server.AndroidProcessInspector
 import com.smartdone.vm.core.virtual.server.ProcessInspector
@@ -94,22 +95,26 @@ object EvokeCoreModule {
     fun provideEvokeCore(
         @ApplicationContext context: Context,
         repository: EvokeAppRepository,
+        apkFileImporter: ApkFileImporter,
         packageManagerService: EvokePackageManagerService,
         activityManagerService: EvokeActivityManagerService,
         permissionDelegateService: PermissionDelegateService,
         broadcastManager: EvokeBroadcastManager,
         contentProviderManager: EvokeContentProviderManager,
         processSlotManager: ProcessSlotManager,
-        sandboxPath: SandboxPath
+        sandboxPath: SandboxPath,
+        settingsRepository: EvokeSettingsRepository
     ): EvokeCore = EvokeCore(
         context = context,
         repository = repository,
+        apkFileImporter = apkFileImporter,
         packageManagerService = packageManagerService,
         activityManagerService = activityManagerService,
         permissionDelegateService = permissionDelegateService,
         broadcastManager = broadcastManager,
         contentProviderManager = contentProviderManager,
         processSlotManager = processSlotManager,
-        sandboxPath = sandboxPath
+        sandboxPath = sandboxPath,
+        settingsRepository = settingsRepository
     )
 }

@@ -11,8 +11,8 @@ import com.smartdone.vm.core.virtual.client.RuntimeBootstrapResult
 import com.smartdone.vm.core.virtual.client.EvokeAppClient
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntime
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntimeSession
-import com.smartdone.vm.core.virtual.client.hook.DeviceInfoHook
 import com.smartdone.vm.runtime.StubLaunchReporter
+import com.smartdone.vm.runtime.EmbeddedVirtualActivityController
 import com.smartdone.vm.core.virtual.server.EvokeServiceFetcher
 import com.smartdone.vm.core.virtual.util.StubActivityRouter
 import dagger.hilt.EntryPoint
@@ -23,13 +23,19 @@ import dagger.hilt.components.SingletonComponent
 open class BaseStubActivity : ComponentActivity() {
     private var runtimeSession: EvokeAppRuntimeSession? = null
     private var bootstrapResult: RuntimeBootstrapResult? = null
+    private var embeddedController: EmbeddedVirtualActivityController? = null
 
     override fun attachBaseContext(newBase: android.content.Context) {
         super.attachBaseContext(newBase)
         val launchRecord = intent?.let { StubActivityRouter.read(it, javaClass.name) } ?: return
         val evokeAppClient = entryPoint().evokeAppClient()
         if (evokeAppClient.currentPackageName() != launchRecord.packageName) {
-            evokeAppClient.initialize(newBase, launchRecord.packageName, launchRecord.userId)
+            evokeAppClient.initialize(
+                newBase,
+                launchRecord.packageName,
+                launchRecord.userId,
+                launchRecord.apkPath
+            )
         }
     }
 
@@ -38,10 +44,19 @@ open class BaseStubActivity : ComponentActivity() {
         val launchRecord = StubActivityRouter.read(intent, javaClass.name)
         val evokeAppClient = entryPoint().evokeAppClient()
         if (evokeAppClient.currentPackageName() != launchRecord.packageName) {
-            evokeAppClient.initialize(this, launchRecord.packageName, launchRecord.userId)
+            evokeAppClient.initialize(
+                this,
+                launchRecord.packageName,
+                launchRecord.userId,
+                launchRecord.apkPath
+            )
         }
-        entryPoint().serviceFetcher().activityManager()
-            ?.reportAppLaunch(launchRecord.packageName, launchRecord.userId, Process.myPid())
+        runCatching {
+            entryPoint().serviceFetcher().activityManager()
+                ?.reportAppLaunch(launchRecord.packageName, launchRecord.userId, Process.myPid())
+        }.onFailure {
+            Log.w(TAG, "Unable to report app launch for ${launchRecord.packageName}", it)
+        }
         var failureStage = "createSession"
         val bootstrapFailure = runCatching {
             runtimeSession = entryPoint().evokeAppRuntime().createSession(
@@ -50,7 +65,9 @@ open class BaseStubActivity : ComponentActivity() {
                 userId = launchRecord.userId,
                 apkPathOverride = launchRecord.apkPath,
                 launcherActivityOverride = launchRecord.launcherActivity,
-                applicationClassNameOverride = launchRecord.applicationClassName
+                applicationClassNameOverride = launchRecord.applicationClassName,
+                nativeLibDirOverride = launchRecord.nativeLibDir,
+                optimizedDirOverride = launchRecord.optimizedDir
             )
             failureStage = "bootstrapApplication"
             bootstrapResult = runtimeSession?.let { session ->
@@ -83,11 +100,7 @@ open class BaseStubActivity : ComponentActivity() {
             )
             return
         }
-        val label = intent.getStringExtra(EvokeCore.EXTRA_LABEL) ?: "Stub"
         val realActivity = launchRecord.realIntent.component?.className ?: "unknown"
-        val applicationClass = runtimeSession?.applicationClassName ?: "default"
-        val classLoaderName = runtimeSession?.evokeAppClassLoader?.javaClass?.simpleName ?: "unavailable"
-        val deviceInfo = entryPoint().deviceInfoHook()
         StubLaunchReporter.report(
             context = this,
             packageName = launchRecord.packageName,
@@ -97,26 +110,78 @@ open class BaseStubActivity : ComponentActivity() {
             launcherStatus = bootstrapResult?.launcherStatus ?: "skipped",
             activityStatus = bootstrapResult?.activityStatus ?: "skipped"
         )
-        if (launchInstalledActivity(launchRecord.realIntent, launchRecord.packageName)) {
-            finish()
+        val controller = EmbeddedVirtualActivityController(
+            hostActivity = this,
+            appRuntime = entryPoint().evokeAppRuntime(),
+            runtimeSession = runtimeSession ?: run {
+                setFailureContent(
+                    launchRecord = launchRecord,
+                    failureMessage = "IllegalStateException: Runtime session missing"
+                )
+                return
+            },
+            bootstrapResult = bootstrapResult ?: run {
+                setFailureContent(
+                    launchRecord = launchRecord,
+                    failureMessage = "IllegalStateException: Bootstrap result missing"
+                )
+                return
+            },
+            launchRecord = launchRecord,
+            evokeCore = entryPoint().evokeCore()
+        )
+        when (val result = controller.launch()) {
+            is EmbeddedVirtualActivityController.LaunchResult.Success -> {
+                embeddedController = controller
+                Log.i(TAG, "Embedded virtual activity launched: ${result.activity.componentName}")
+            }
+            is EmbeddedVirtualActivityController.LaunchResult.Failure -> {
+                Log.e(TAG, "Embedded virtual activity launch failed: ${result.message}")
+                setFailureContent(launchRecord, result.message)
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        Log.d(TAG, "Stub onStart ${componentName.className}")
+        embeddedController?.dispatchStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Log.d(TAG, "Stub onResume ${componentName.className}")
+        embeddedController?.dispatchResume()
+    }
+
+    override fun onPause() {
+        Log.d(TAG, "Stub onPause ${componentName.className}")
+        embeddedController?.dispatchPause()
+        super.onPause()
+    }
+
+    override fun onStop() {
+        Log.d(TAG, "Stub onStop ${componentName.className}")
+        embeddedController?.dispatchStop()
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        Log.d(TAG, "Stub onDestroy ${componentName.className}")
+        embeddedController?.dispatchDestroy()
+        super.onDestroy()
+    }
+
+    override fun finish() {
+        Log.w(TAG, "Stub finish requested for ${componentName.className}", Throwable("finish trace"))
+        super.finish()
+    }
+
+    override fun onBackPressed() {
+        if (embeddedController?.dispatchBackPressed() == true) {
             return
         }
-        setContentView(
-            TextView(this).apply {
-                text =
-                    "Launching $label in stub process\n" +
-                    "package=${launchRecord.packageName}\n" +
-                    "userId=${launchRecord.userId}\n" +
-                    "real=$realActivity\n" +
-                    "appClass=$applicationClass\n" +
-                    "loader=$classLoaderName\n" +
-                    "appBootstrap=${bootstrapResult?.applicationStatus ?: "skipped"}\n" +
-                    "launcherLoad=${bootstrapResult?.launcherStatus ?: "skipped"}\n" +
-                    "activityBootstrap=${bootstrapResult?.activityStatus ?: "skipped"}\n" +
-                    "androidId=${deviceInfo.androidId(launchRecord.packageName)}\n" +
-                    "deviceId=${deviceInfo.deviceId(launchRecord.packageName)}"
-            }
-        )
+        super.onBackPressed()
     }
 
     override fun getResources() = runtimeSession?.resources ?: super.getResources()
@@ -134,29 +199,12 @@ open class BaseStubActivity : ComponentActivity() {
     interface StubActivityEntryPoint {
         fun evokeAppClient(): EvokeAppClient
         fun evokeAppRuntime(): EvokeAppRuntime
+        fun evokeCore(): EvokeCore
         fun serviceFetcher(): EvokeServiceFetcher
-        fun deviceInfoHook(): DeviceInfoHook
     }
 
     private fun entryPoint(): StubActivityEntryPoint =
         EntryPointAccessors.fromApplication(applicationContext, StubActivityEntryPoint::class.java)
-
-    private fun launchInstalledActivity(intent: Intent, packageName: String): Boolean {
-        val component = intent.component ?: return false
-        val forwardIntent = Intent(intent).apply {
-            removeExtra(EvokeCore.EXTRA_PACKAGE_NAME)
-            removeExtra(EvokeCore.EXTRA_USER_ID)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        Log.i(TAG, "Attempting to forward to installed activity $component for $packageName")
-        return runCatching {
-            applicationContext.startActivity(forwardIntent)
-            Log.i(TAG, "Forwarded to installed activity $component")
-            true
-        }.onFailure {
-            Log.w(TAG, "Unable to forward to installed activity $component", it)
-        }.getOrDefault(false)
-    }
 
     private fun buildFailureMessage(throwable: Throwable): String =
         buildString {
@@ -167,6 +215,22 @@ open class BaseStubActivity : ComponentActivity() {
                 append(message)
             }
         }
+
+    private fun setFailureContent(
+        launchRecord: com.smartdone.vm.core.virtual.util.StubActivityRecord,
+        failureMessage: String
+    ) {
+        setContentView(
+            TextView(this).apply {
+                text =
+                    "Evoke launch failed\n" +
+                        "package=${launchRecord.packageName}\n" +
+                        "userId=${launchRecord.userId}\n" +
+                        "real=${launchRecord.realIntent.component?.className ?: "unknown"}\n" +
+                        "launchFailed=$failureMessage"
+            }
+        )
+    }
 
     companion object {
         private const val TAG = "StubActivity"

@@ -105,6 +105,34 @@ class SandboxPath @Inject constructor(
 
     fun tempImportDir(): File = File(root(), "tmp").ensure()
 
+    fun stagedLaunchesDir(): File = File(root(), "launches").ensure()
+
+    fun stagedLaunchDir(packageName: String, launchId: String): File =
+        File(stagedLaunchesDir(), "${packageName}_$launchId").ensure()
+
+    fun stagedLaunchApkPath(packageName: String, launchId: String): File =
+        File(stagedLaunchDir(packageName, launchId), "base.apk")
+
+    fun stagedLaunchSplitDir(packageName: String, launchId: String): File =
+        File(stagedLaunchDir(packageName, launchId), "splits").ensure()
+
+    fun stagedLaunchNativeLibDir(packageName: String, launchId: String): File =
+        File(stagedLaunchDir(packageName, launchId), "libs").ensure()
+
+    fun stagedLaunchOptimizedDir(packageName: String, launchId: String): File =
+        File(stagedLaunchDir(packageName, launchId), "oat").ensure()
+
+    fun managedSplitApkPaths(packageName: String): List<String> =
+        splitDir(packageName).listFiles()
+            .orEmpty()
+            .filter { it.isFile && it.extension == "apk" }
+            .sortedBy { it.name }
+            .map(File::getAbsolutePath)
+
+    fun sealStandaloneArchive(target: File) {
+        sealArchive(target)
+    }
+
     private fun sealArchive(target: File) {
         if (!target.exists() || !target.isFile) return
         target.setReadable(true, false)

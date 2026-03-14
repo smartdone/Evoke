@@ -11,7 +11,9 @@ data class StubActivityRecord(
     val realIntent: Intent,
     val apkPath: String,
     val launcherActivity: String?,
-    val applicationClassName: String?
+    val applicationClassName: String?,
+    val nativeLibDir: String? = null,
+    val optimizedDir: String? = null
 )
 
 object StubActivityRouter {
@@ -19,6 +21,8 @@ object StubActivityRouter {
     private const val EXTRA_APK_PATH = "extra_apk_path"
     private const val EXTRA_LAUNCHER_ACTIVITY = "extra_launcher_activity"
     private const val EXTRA_APPLICATION_CLASS = "extra_application_class"
+    private const val EXTRA_NATIVE_LIB_DIR = "extra_native_lib_dir"
+    private const val EXTRA_OPTIMIZED_DIR = "extra_optimized_dir"
 
     fun buildLaunchIntent(
         hostPackage: String,
@@ -34,6 +38,8 @@ object StubActivityRouter {
         putExtra(EXTRA_APK_PATH, record.apkPath)
         putExtra(EXTRA_LAUNCHER_ACTIVITY, record.launcherActivity)
         putExtra(EXTRA_APPLICATION_CLASS, record.applicationClassName)
+        putExtra(EXTRA_NATIVE_LIB_DIR, record.nativeLibDir)
+        putExtra(EXTRA_OPTIMIZED_DIR, record.optimizedDir)
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
 
@@ -52,7 +58,9 @@ object StubActivityRouter {
             realIntent = realIntent,
             apkPath = intent.getStringExtra(EXTRA_APK_PATH).orEmpty(),
             launcherActivity = intent.getStringExtra(EXTRA_LAUNCHER_ACTIVITY),
-            applicationClassName = intent.getStringExtra(EXTRA_APPLICATION_CLASS)
+            applicationClassName = intent.getStringExtra(EXTRA_APPLICATION_CLASS),
+            nativeLibDir = intent.getStringExtra(EXTRA_NATIVE_LIB_DIR),
+            optimizedDir = intent.getStringExtra(EXTRA_OPTIMIZED_DIR)
         )
     }
 }

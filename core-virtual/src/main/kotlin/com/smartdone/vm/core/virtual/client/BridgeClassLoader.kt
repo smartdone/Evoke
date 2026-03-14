@@ -13,9 +13,14 @@ class BridgeClassLoader(
     override fun loadClass(name: String, resolve: Boolean): Class<*> {
         if (
             name.startsWith("android.") ||
+            name.startsWith("dalvik.") ||
             name.startsWith("java.") ||
             name.startsWith("javax.") ||
-            name.startsWith("kotlin.")
+            name.startsWith("kotlin.") ||
+            name.startsWith("org.json.") ||
+            name.startsWith("org.w3c.") ||
+            name.startsWith("org.xml.sax.") ||
+            name.startsWith("org.xmlpull.")
         ) {
             return super.loadClass(name, resolve)
         }

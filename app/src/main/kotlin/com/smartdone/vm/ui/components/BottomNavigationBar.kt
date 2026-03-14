@@ -26,11 +26,26 @@ fun BottomNavigationBar(
     NavigationBar {
         items.forEach { (destination, icon) ->
             NavigationBarItem(
-                selected = currentDestination == destination.route,
+                selected = destination.matchesRoute(currentDestination),
                 onClick = { onNavigate(destination) },
                 icon = { Icon(icon, contentDescription = null) },
-                label = { Text(destination.route.replaceFirstChar(Char::uppercase)) }
+                label = { Text(destination.label) }
             )
         }
     }
 }
+
+private fun Destination.matchesRoute(route: String?): Boolean =
+    when (this) {
+        Destination.Install -> route == Destination.Install.pattern || route?.startsWith("install/") == true
+        else -> route == this.route
+    }
+
+private val Destination.label: String
+    get() = when (this) {
+        Destination.Home -> "Home"
+        Destination.Install -> "Install"
+        Destination.Running -> "Running"
+        Destination.Settings -> "Settings"
+        Destination.Detail -> "Detail"
+    }

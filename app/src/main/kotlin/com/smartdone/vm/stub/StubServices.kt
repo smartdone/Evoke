@@ -3,10 +3,20 @@ package com.smartdone.vm.stub
 import android.app.Service
 import android.content.Intent
 import android.os.Binder
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
 
 open class BaseStubService : Service() {
-    private val binder = Binder()
+    private val binder = Messenger(
+        object : Handler(Looper.getMainLooper()) {
+            override fun handleMessage(msg: Message) {
+                // Swallow guest service traffic for framework-style helpers like Firebase Sessions.
+            }
+        }
+    ).binder
 
     override fun onBind(intent: Intent?): IBinder = binder
 }
