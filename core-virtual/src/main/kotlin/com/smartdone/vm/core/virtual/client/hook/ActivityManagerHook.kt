@@ -107,36 +107,14 @@ class ActivityManagerHook @Inject constructor(
     fun isInstalled(): Boolean = installed
 
     fun shouldSilentlyDenyBind(intent: Intent): Boolean {
-        val targetPackage = intent.component?.packageName ?: intent.`package` ?: return false
-        if (evokePackageName != APKPURE_PACKAGE_NAME) return false
-        if (targetPackage == GOOGLE_PLAY_SERVICES_PACKAGE) {
-            Log.i(
-                "ActivityManagerHook",
-                "Silently denying external GMS bind action=${intent.action} component=${intent.component}"
-            )
-            return true
-        }
-        if (targetPackage != evokePackageName) return false
-        val targetService = intent.component?.className ?: return false
-        return targetService in APKPURE_BIND_SERVICE_DENYLIST
+        return false
     }
 
     private fun shouldRewriteBindService(serviceName: String): Boolean {
-        if (evokePackageName != APKPURE_PACKAGE_NAME) return true
-        return serviceName in APKPURE_BIND_SERVICE_ALLOWLIST
+        return true
     }
 
     companion object {
-        private const val APKPURE_PACKAGE_NAME = "com.apkpure.aegon"
-        private const val GOOGLE_PLAY_SERVICES_PACKAGE = "com.google.android.gms"
         private const val EXTRA_ORIGINAL_SERVICE = "com.smartdone.vm.extra.ORIGINAL_SERVICE"
-        private val APKPURE_BIND_SERVICE_ALLOWLIST = setOf(
-            "com.google.firebase.sessions.SessionLifecycleService",
-            "com.apkpure.aegon.services.QDDownloadService",
-            "com.apkpure.aegon.services.AppProtoBufUpdateService"
-        )
-        private val APKPURE_BIND_SERVICE_DENYLIST = setOf(
-            "com.google.android.gms.tagmanager.TagManagerService"
-        )
     }
 }

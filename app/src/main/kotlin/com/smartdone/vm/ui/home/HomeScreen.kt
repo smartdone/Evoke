@@ -7,6 +7,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,16 +16,16 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddCircleOutline
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Stop
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
@@ -43,7 +45,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import coil.compose.AsyncImage
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(
+    ExperimentalMaterial3Api::class,
+    ExperimentalFoundationApi::class,
+    ExperimentalLayoutApi::class
+)
 @Composable
 fun HomeScreen(
     onAddAppClick: (Int) -> Unit,
@@ -84,72 +90,79 @@ fun HomeScreen(
                     Text("添加应用")
                 }
             }
-            items(appGroups, key = { it.app.packageName }) { group ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .combinedClickable(
-                            onClick = { onAppClick(group.app.packageName) },
-                            onLongClick = { manageTarget = group }
-                        ),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surface
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        AsyncImage(
-                            model = group.app.iconPath,
-                            contentDescription = null,
-                            modifier = Modifier.size(56.dp),
-                            contentScale = ContentScale.Fit
+            itemsIndexed(appGroups, key = { _, item -> item.app.packageName }) { index, group ->
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { onAppClick(group.app.packageName) },
+                                onLongClick = { manageTarget = group }
+                            ),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface
                         )
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                            verticalAlignment = Alignment.Top
                         ) {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(group.app.label, style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    group.app.packageName,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AsyncImage(
+                                model = group.app.iconPath,
+                                contentDescription = null,
+                                modifier = Modifier.size(56.dp),
+                                contentScale = ContentScale.Fit
+                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(group.app.label, style = MaterialTheme.typography.titleMedium)
                                     Text(
-                                        "v${group.app.versionCode}",
-                                        style = MaterialTheme.typography.bodySmall
+                                        group.app.packageName,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
-                                    Text(
-                                        "${group.instances.size} 个实例",
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(
+                                            "v${group.app.versionCode}",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                        Text(
+                                            "${group.instances.size} 个实例",
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
                                 }
-                            }
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(onClick = { viewModel.launch(group.app.packageName) }) {
-                                    Icon(Icons.Outlined.PlayArrow, contentDescription = null)
-                                    Text("启动")
-                                }
-                                if (group.app.isRunning) {
-                                    OutlinedButton(onClick = { viewModel.stop(group.app.packageName) }) {
-                                        Icon(Icons.Outlined.Stop, contentDescription = null)
-                                        Text("停止")
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(onClick = { viewModel.launch(group.app.packageName) }) {
+                                        Icon(Icons.Outlined.PlayArrow, contentDescription = null)
+                                        Text("启动")
+                                    }
+                                    if (group.app.isRunning) {
+                                        OutlinedButton(onClick = { viewModel.stop(group.app.packageName) }) {
+                                            Icon(Icons.Outlined.Stop, contentDescription = null)
+                                            Text("停止")
+                                        }
+                                    }
+                                    group.instances.forEach { instance ->
+                                        OutlinedButton(
+                                            onClick = { viewModel.launch(group.app.packageName, instance.userId) },
+                                        ) {
+                                            Text(instanceDisplayName(group, instance))
+                                        }
                                     }
                                 }
                             }
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                group.instances.forEach { instance ->
-                                    AssistChip(
-                                        onClick = { viewModel.launch(group.app.packageName, instance.userId) },
-                                        label = { Text("${instance.displayName} · user ${instance.userId}") }
-                                    )
-                                }
-                            }
                         }
+                    }
+                    if (index != appGroups.lastIndex) {
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     }
                 }
             }
@@ -249,5 +262,17 @@ fun HomeScreen(
                 )
             }
         }
+    }
+}
+
+private fun instanceDisplayName(
+    group: com.smartdone.vm.core.virtual.model.EvokeAppGroupSummary,
+    instance: com.smartdone.vm.core.virtual.model.EvokeAppInstanceSummary
+): String {
+    val baseName = instance.displayName.ifBlank { group.app.label }
+    return if (baseName.endsWith(".user${instance.userId}")) {
+        baseName
+    } else {
+        "$baseName.user${instance.userId}"
     }
 }

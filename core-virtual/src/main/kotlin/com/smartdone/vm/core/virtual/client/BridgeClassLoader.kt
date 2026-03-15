@@ -1,5 +1,7 @@
 package com.smartdone.vm.core.virtual.client
 
+import android.util.Log
+
 class BridgeClassLoader(
     private val hostClassLoader: ClassLoader,
     private val hookClassWhitelist: Set<String>
@@ -11,16 +13,29 @@ class BridgeClassLoader(
     )
 
     override fun loadClass(name: String, resolve: Boolean): Class<*> {
+        if (name.startsWith("kotlin.reflect.")) {
+            return runCatching {
+                hostClassLoader.loadClass(name)
+            }.onFailure {
+                Log.v(TAG, "Host kotlin-reflect fallback unavailable for $name", it)
+            }.getOrElse {
+                throw ClassNotFoundException(name, it)
+            }
+        }
         if (
             name.startsWith("android.") ||
+            name.startsWith("com.android.internal.") ||
             name.startsWith("dalvik.") ||
             name.startsWith("java.") ||
             name.startsWith("javax.") ||
+            name.startsWith("jdk.") ||
             name.startsWith("kotlin.") ||
+            name.startsWith("libcore.") ||
             name.startsWith("org.json.") ||
             name.startsWith("org.w3c.") ||
             name.startsWith("org.xml.sax.") ||
-            name.startsWith("org.xmlpull.")
+            name.startsWith("org.xmlpull.") ||
+            name.startsWith("sun.")
         ) {
             return super.loadClass(name, resolve)
         }
@@ -28,5 +43,9 @@ class BridgeClassLoader(
             return hostClassLoader.loadClass(name)
         }
         throw ClassNotFoundException(name)
+    }
+
+    companion object {
+        private const val TAG = "BridgeClassLoader"
     }
 }

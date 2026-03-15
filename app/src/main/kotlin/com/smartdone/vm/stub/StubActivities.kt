@@ -1,6 +1,7 @@
 package com.smartdone.vm.stub
 
 import android.content.Intent
+import android.content.ServiceConnection
 import android.os.Bundle
 import android.os.Process
 import android.util.Log
@@ -12,6 +13,7 @@ import com.smartdone.vm.core.virtual.client.RuntimeBootstrapResult
 import com.smartdone.vm.core.virtual.client.EvokeAppClient
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntime
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntimeSession
+import com.smartdone.vm.core.virtual.client.hook.ExternalServiceBinderHook
 import com.smartdone.vm.runtime.StubLaunchReporter
 import com.smartdone.vm.runtime.EmbeddedVirtualActivityController
 import com.smartdone.vm.core.virtual.server.EvokeServiceFetcher
@@ -20,6 +22,7 @@ import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
 import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.components.SingletonComponent
+import java.util.concurrent.Executor
 
 open class BaseStubActivity : ComponentActivity() {
     private var runtimeSession: EvokeAppRuntimeSession? = null
@@ -192,9 +195,81 @@ open class BaseStubActivity : ComponentActivity() {
 
     override fun getClassLoader() = runtimeSession?.evokeAppClassLoader ?: super.getClassLoader()
 
-    override fun getPackageName() = runtimeSession?.packageName ?: super.getPackageName()
+    override fun getPackageName(): String {
+        val guestPackageName = runtimeSession?.packageName ?: return super.getPackageName()
+        return if (shouldExposeHostPackageName()) super.getPackageName() else guestPackageName
+    }
 
-    override fun getOpPackageName() = runtimeSession?.packageName ?: super.getOpPackageName()
+    override fun getOpPackageName() = super.getOpPackageName()
+
+    override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean =
+        super.bindService(service, ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn), flags)
+
+    override fun bindService(
+        service: Intent,
+        conn: ServiceConnection,
+        flags: android.content.Context.BindServiceFlags
+    ): Boolean = super.bindService(
+        service,
+        ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn),
+        flags
+    )
+
+    override fun bindService(
+        service: Intent,
+        flags: Int,
+        executor: Executor,
+        conn: ServiceConnection
+    ): Boolean = super.bindService(
+        service,
+        flags,
+        executor,
+        ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn)
+    )
+
+    override fun bindService(
+        service: Intent,
+        flags: android.content.Context.BindServiceFlags,
+        executor: Executor,
+        conn: ServiceConnection
+    ): Boolean = super.bindService(
+        service,
+        flags,
+        executor,
+        ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn)
+    )
+
+    override fun bindIsolatedService(
+        service: Intent,
+        flags: Int,
+        instanceName: String,
+        executor: Executor,
+        conn: ServiceConnection
+    ): Boolean = super.bindIsolatedService(
+        service,
+        flags,
+        instanceName,
+        executor,
+        ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn)
+    )
+
+    override fun bindIsolatedService(
+        service: Intent,
+        flags: android.content.Context.BindServiceFlags,
+        instanceName: String,
+        executor: Executor,
+        conn: ServiceConnection
+    ): Boolean = super.bindIsolatedService(
+        service,
+        flags,
+        instanceName,
+        executor,
+        ExternalServiceBinderHook.wrapConnectionIfNeeded(service, conn)
+    )
+
+    override fun unbindService(conn: ServiceConnection) {
+        super.unbindService(ExternalServiceBinderHook.unwrapConnection(conn))
+    }
 
     @EntryPoint
     @InstallIn(SingletonComponent::class)
@@ -240,7 +315,18 @@ open class BaseStubActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "StubActivity"
+        private val HOST_IDENTITY_CALLER_PREFIXES = listOf(
+            "com.google.android.gms.",
+            "com.google.firebase.",
+            "com.google.android.datatransport.",
+            "com.google.android.play."
+        )
     }
+
+    private fun shouldExposeHostPackageName(): Boolean =
+        Thread.currentThread().stackTrace.any { frame ->
+            HOST_IDENTITY_CALLER_PREFIXES.any(frame.className::startsWith)
+        }
 }
 
 class StubActivity_P0_A0 : BaseStubActivity()

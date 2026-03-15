@@ -3,6 +3,8 @@ package com.smartdone.vm.core.virtual.install
 import android.content.ContentResolver
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.util.Log
 import com.smartdone.vm.core.virtual.model.CopiedAppLayout
 import com.smartdone.vm.core.virtual.model.CopyEvent
 import com.smartdone.vm.core.virtual.model.StagedLaunchLayout
@@ -76,6 +78,12 @@ class ApkFileImporter @Inject constructor(
         val nativeLibDir = sandboxPath.stagedLaunchNativeLibDir(metadata.packageName, launchId)
         extractNativeLibraries(target, nativeLibDir)
         tempFile.delete()
+        Log.i(
+            TAG,
+            "Prepared staged launch package=${metadata.packageName} " +
+                "launcher=${metadata.launcherActivity ?: metadata.activities.firstOrNull()} " +
+                "baseApk=${target.absolutePath} splitCount=${splitTargets.size}"
+        )
         return StagedLaunchLayout(
             packageName = metadata.packageName,
             label = metadata.label.ifBlank { metadata.packageName },
@@ -90,14 +98,32 @@ class ApkFileImporter @Inject constructor(
 
     private fun extractNativeLibraries(apkFile: File, targetDir: File) {
         ZipFile(apkFile).use { zip ->
-            zip.entries().asSequence()
+            val nativeEntries = zip.entries().asSequence()
                 .filter { !it.isDirectory && it.name.startsWith("lib/") && it.name.endsWith(".so") }
-                .forEach { entry ->
+                .mapNotNull { entry ->
+                    val segments = entry.name.split('/')
+                    val abi = segments.getOrNull(1) ?: return@mapNotNull null
+                    abi to entry
+                }
+                .toList()
+            if (nativeEntries.isEmpty()) {
+                return
+            }
+            val availableAbis = nativeEntries.map { it.first }.distinct()
+            val selectedAbi = Build.SUPPORTED_ABIS.firstOrNull(availableAbis::contains)
+                ?: availableAbis.first()
+            nativeEntries.asSequence()
+                .filter { it.first == selectedAbi }
+                .forEach { (_, entry) ->
                     val target = File(targetDir, File(entry.name).name)
                     zip.getInputStream(entry).use { input ->
                         target.outputStream().use { output -> input.copyTo(output) }
                     }
                 }
+            Log.i(
+                TAG,
+                "Extracted native libraries abi=$selectedAbi count=${nativeEntries.count { it.first == selectedAbi }} apk=${apkFile.name}"
+            )
         }
     }
 
@@ -127,5 +153,9 @@ class ApkFileImporter @Inject constructor(
                 target.absolutePath
             }
             .toList()
+    }
+
+    companion object {
+        private const val TAG = "ApkFileImporter"
     }
 }

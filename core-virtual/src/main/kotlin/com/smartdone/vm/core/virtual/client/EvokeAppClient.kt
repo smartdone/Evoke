@@ -9,6 +9,8 @@ import com.smartdone.vm.core.virtual.client.hook.BroadcastHook
 import com.smartdone.vm.core.virtual.client.hook.ContentProviderHook
 import com.smartdone.vm.core.virtual.client.hook.ContextHook
 import com.smartdone.vm.core.virtual.client.hook.DeviceInfoHook
+import com.smartdone.vm.core.virtual.client.hook.ExternalServiceBinderHook
+import com.smartdone.vm.core.virtual.client.hook.GuestRuntimeCrashShield
 import com.smartdone.vm.core.virtual.client.hook.PackageManagerHook
 import com.smartdone.vm.core.virtual.client.hook.VirtualPackageArchiveResolver
 import com.smartdone.vm.core.virtual.server.EvokeServiceFetcher
@@ -43,7 +45,9 @@ class EvokeAppClient @Inject constructor(
         packageManagerHook.install(packageName)
         contentProviderHook.install(context, userId)
         broadcastHook.install(packageName)
-        contextHook.install(packageName)
+        contextHook.install(packageName, context.packageName)
+        ExternalServiceBinderHook.install(packageName, context.packageName)
+        GuestRuntimeCrashShield.install(packageName)
         permissionHook.install(context, packageName)
         deviceInfoHook.install(packageName, userId)
         serviceFetcher.packageManager()
