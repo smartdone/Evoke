@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Instrumentation
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.os.Bundle
@@ -21,8 +22,10 @@ import androidx.core.view.WindowInsetsCompat
 import com.smartdone.vm.core.virtual.EvokeCore
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntime
 import com.smartdone.vm.core.virtual.client.EvokeAppRuntimeSession
+import com.smartdone.vm.core.virtual.client.PreferredThemeResolution
 import com.smartdone.vm.core.virtual.client.RuntimeBootstrapResult
 import com.smartdone.vm.core.virtual.util.StubActivityRecord
+import com.smartdone.vm.core.virtual.util.StubActivityRouter
 import kotlinx.coroutines.runBlocking
 
 internal class EmbeddedVirtualActivityController(
@@ -49,7 +52,8 @@ internal class EmbeddedVirtualActivityController(
             val result = runCatching {
                 val targetInfo = runtimeSession.activityInfos[targetClassName]
                     ?: buildFallbackActivityInfo(targetClassName)
-                val themeResId = resolveThemeResId(targetInfo)
+                val preferredTheme = resolveTheme(targetInfo)
+                val themeResId = preferredTheme.themeResId
                 val activityContext = appRuntime.createActivityContext(
                     base = hostActivity,
                     session = runtimeSession,
@@ -57,11 +61,19 @@ internal class EmbeddedVirtualActivityController(
                     themeResIdOverride = themeResId,
                     reportedPackageNameOverride = hostActivity.applicationContext.packageName
                 )
+                synchronizeContextTheme(
+                    target = activityContext,
+                    source = preferredTheme.themeContext,
+                    themeResId = themeResId,
+                    label = "activityContext"
+                )
                 Log.i(
                     TAG,
                     "Attempting embedded launch activity=$targetClassName theme=0x${themeResId.toString(16)} " +
                         "activityTheme=0x${targetInfo.theme.toString(16)} appTheme=0x${runtimeSession.applicationInfo.theme.toString(16)} " +
-                        "contextPkg=${activityContext.packageName} appCtx=${activityContext.applicationContext.javaClass.name}"
+                        "contextPkg=${activityContext.packageName} appCtx=${activityContext.applicationContext.javaClass.name} " +
+                        "preferredSource=${preferredTheme.sourceClassName ?: "manifest"}#" +
+                        "${preferredTheme.sourceMethodName ?: "theme"}"
                 )
                 val launchIntent = Intent(launchRecord.realIntent).apply {
                     setClassName(runtimeSession.packageName, targetClassName)
@@ -73,7 +85,11 @@ internal class EmbeddedVirtualActivityController(
                 val proxyInstrumentation = EvokeInstrumentationProxy(
                     base = baseInstrumentation,
                     evokeCore = evokeCore,
-                    userId = launchRecord.userId
+                    userId = launchRecord.userId,
+                    hostPackageName = hostActivity.packageName,
+                    guestPackageName = runtimeSession.packageName,
+                    guestActivityNames = runtimeSession.activityInfos.keys,
+                    fallbackGuestLauncher = ::launchViaCurrentStub
                 )
                 val activity = runtimeSession.evokeAppClassLoader
                     .loadClass(targetClassName)
@@ -86,9 +102,9 @@ internal class EmbeddedVirtualActivityController(
                     launchIntent = launchIntent,
                     activityInfo = targetInfo
                 )
-                synchronizeAttachedActivity(activity, activityContext)
+                synchronizeAttachedActivity(activity, activityContext, preferredTheme)
                 logEmbeddedEnvironment(activity, activityContext)
-                applyEmbeddedTheme(activity, themeResId)
+                applyEmbeddedTheme(activity, activityContext, preferredTheme)
                 proxyInstrumentation.callActivityOnCreate(activity, null)
                 bindDecorView(activity)
                 instrumentation = proxyInstrumentation
@@ -234,25 +250,54 @@ internal class EmbeddedVirtualActivityController(
             requestApplyInsets()
         }
 
-    private fun applyEmbeddedTheme(activity: Activity, themeResId: Int) {
+    private fun applyEmbeddedTheme(
+        activity: Activity,
+        activityContext: Context,
+        preferredTheme: PreferredThemeResolution
+    ) {
+        val themeResId = preferredTheme.themeResId
         if (themeResId != 0) {
             activity.setTheme(themeResId)
         }
+        synchronizeContextTheme(
+            target = activity,
+            source = preferredTheme.themeContext ?: activityContext,
+            themeResId = themeResId,
+            label = "activity"
+        )
     }
 
-    private fun synchronizeAttachedActivity(activity: Activity, activityContext: Context) {
+    private fun synchronizeAttachedActivity(
+        activity: Activity,
+        activityContext: Context,
+        preferredTheme: PreferredThemeResolution
+    ) {
         runCatching {
             activity.writeField("mResources", activityContext.resources)
             activity.writeField("mInflater", LayoutInflater.from(activityContext))
+            synchronizeContextTheme(
+                target = activity,
+                source = preferredTheme.themeContext ?: activityContext,
+                themeResId = preferredTheme.themeResId,
+                label = "attachedActivity"
+            )
             activity.window?.let { window ->
                 window.writeField("mContext", activityContext)
                 window.writeField("mDecorContext", activityContext)
                 window.writeField("mLayoutInflater", LayoutInflater.from(activityContext))
+                synchronizeContextTheme(
+                    target = window.context,
+                    source = preferredTheme.themeContext ?: activityContext,
+                    themeResId = preferredTheme.themeResId,
+                    label = "windowContext"
+                )
             }
             Log.d(
                 TAG,
                 "Synchronized attached activity resources activity=${activity.javaClass.name} " +
-                    "resources=${activity.resources} base=${describeContextChain(activity.baseContext)}"
+                    "resources=${activity.resources} base=${describeContextChain(activity.baseContext)} " +
+                    "activityTheme=0x${readThemeResId(activity).toString(16)} " +
+                    "contextTheme=0x${readThemeResId(activityContext).toString(16)}"
             )
         }.onFailure {
             Log.w(TAG, "Unable to synchronize attached activity internals", it)
@@ -295,11 +340,47 @@ internal class EmbeddedVirtualActivityController(
         }
     }
 
-    private fun resolveThemeResId(activityInfo: ActivityInfo): Int =
-        activityInfo.theme
-            .takeIf { it != 0 }
-            ?: activityInfo.applicationInfo?.theme
-            ?: runtimeSession.applicationInfo.theme
+    private fun resolveTheme(activityInfo: ActivityInfo): PreferredThemeResolution =
+        appRuntime.resolvePreferredTheme(
+            session = runtimeSession,
+            fallbackThemeResId = activityInfo.theme
+                .takeIf { it != 0 }
+                ?: activityInfo.applicationInfo?.theme
+                ?: runtimeSession.applicationInfo.theme
+        )
+
+    private fun synchronizeContextTheme(
+        target: Context,
+        source: Context?,
+        themeResId: Int,
+        label: String
+    ) {
+        runCatching {
+            if (themeResId != 0) {
+                target.setTheme(themeResId)
+            }
+            source?.let { sourceContext ->
+                target.theme.setTo(sourceContext.theme)
+                if (themeResId != 0) {
+                    target.theme.applyStyle(themeResId, true)
+                }
+            }
+            Log.i(
+                TAG,
+                "Synchronized theme label=$label target=${target.javaClass.name} " +
+                    "theme=0x${readThemeResId(target).toString(16)} " +
+                    "source=${source?.javaClass?.name ?: "none"} " +
+                    "sourceTheme=0x${readThemeResId(source).toString(16)}"
+            )
+        }.onFailure {
+            Log.w(
+                TAG,
+                "Unable to synchronize theme label=$label target=${target.javaClass.name} " +
+                    "theme=0x${themeResId.toString(16)} source=${source?.javaClass?.name ?: "none"}",
+                it
+            )
+        }
+    }
 
     private fun buildFallbackActivityInfo(targetClassName: String) = ActivityInfo().apply {
         packageName = runtimeSession.packageName
@@ -340,10 +421,43 @@ internal class EmbeddedVirtualActivityController(
             }
         }
 
+    private fun launchViaCurrentStub(intent: Intent): Boolean {
+        val targetClassName = intent.component?.className ?: return false
+        val record = StubActivityRecord(
+            stubClassName = launchRecord.stubClassName,
+            packageName = runtimeSession.packageName,
+            userId = launchRecord.userId,
+            realIntent = Intent(intent).apply {
+                setClassName(runtimeSession.packageName, targetClassName)
+                putExtra(EvokeCore.EXTRA_PACKAGE_NAME, runtimeSession.packageName)
+                putExtra(EvokeCore.EXTRA_USER_ID, launchRecord.userId)
+            },
+            apkPath = runtimeSession.apkPath,
+            launcherActivity = targetClassName,
+            applicationClassName = runtimeSession.applicationClassName,
+            nativeLibDir = runtimeSession.nativeLibDir,
+            optimizedDir = runtimeSession.optimizedDir
+        )
+        val stubIntent = StubActivityRouter.buildLaunchIntent(
+            hostPackage = hostActivity.packageName,
+            stubClassName = launchRecord.stubClassName,
+            record = record,
+            label = hostActivity.intent.getStringExtra(EvokeCore.EXTRA_LABEL)
+                ?: hostActivity.title?.toString().orEmpty().ifBlank { runtimeSession.packageName }
+        )
+        hostActivity.startActivity(stubIntent)
+        Log.i(TAG, "Fallback stub launch routed activity=$targetClassName via=${launchRecord.stubClassName}")
+        return true
+    }
+
     private class EvokeInstrumentationProxy(
         private val base: Instrumentation,
         private val evokeCore: EvokeCore,
-        private val userId: Int
+        private val userId: Int,
+        private val hostPackageName: String,
+        private val guestPackageName: String,
+        private val guestActivityNames: Set<String>,
+        private val fallbackGuestLauncher: (Intent) -> Boolean
     ) : Instrumentation() {
         override fun newActivity(cl: ClassLoader?, className: String?, intent: Intent?): Activity =
             base.newActivity(cl, className, intent)
@@ -443,13 +557,49 @@ internal class EmbeddedVirtualActivityController(
         }
 
         private fun handleVirtualStart(intent: Intent, requestCode: Int): Boolean {
-            val routed = runBlocking { evokeCore.launchIntent(Intent(intent), userId) }
-            Log.i(TAG, "Proxy routed=$routed intent=$intent requestCode=$requestCode")
+            val rewrittenIntent = normalizeGuestIntent(intent)
+            val routed = runBlocking { evokeCore.launchIntent(rewrittenIntent, userId) } ||
+                fallbackGuestLauncher(rewrittenIntent)
+            Log.i(
+                TAG,
+                "Proxy routed=$routed requestCode=$requestCode " +
+                    "originalIntent=$intent rewrittenIntent=$rewrittenIntent"
+            )
             if (routed && requestCode >= 0) {
                 Log.w(TAG, "Activity result delivery is not implemented for embedded virtual activities")
             }
             return routed
         }
+
+        private fun normalizeGuestIntent(intent: Intent): Intent =
+            Intent(intent).apply {
+                val originalComponent = component
+                val originalClassName = originalComponent?.className
+                if (
+                    originalClassName != null &&
+                    !originalClassName.startsWith(hostPackageName) &&
+                    (
+                        originalComponent.packageName == hostPackageName ||
+                            originalComponent.packageName != guestPackageName
+                        )
+                ) {
+                    component = ComponentName(guestPackageName, originalClassName)
+                }
+                if (
+                    (
+                        `package` == hostPackageName ||
+                            component?.packageName == guestPackageName
+                        ) &&
+                    component?.className?.let { className ->
+                        className in guestActivityNames || !className.startsWith(hostPackageName)
+                    } == true
+                ) {
+                    `package` = guestPackageName
+                }
+                if (component?.packageName == guestPackageName) {
+                    putExtra(EvokeCore.EXTRA_PACKAGE_NAME, guestPackageName)
+                }
+            }
 
         private fun invokeBaseHidden(
             name: String,
@@ -497,6 +647,37 @@ private fun looksLikeTransientEntry(className: String): Boolean {
     val lower = className.lowercase()
     return listOf("splash", "guide", "welcome", "intro", "startup", "launch", "first")
         .any(lower::contains)
+}
+
+private fun readThemeResId(context: Context?): Int {
+    if (context == null) {
+        return 0
+    }
+    runCatching {
+        return generateSequence<Class<*>>(context.javaClass) { current ->
+            current.superclass
+        }.flatMap { clazz ->
+            clazz.methods
+                .asSequence()
+                .filter { method ->
+                    method.name == "getThemeResId" &&
+                        method.parameterTypes.isEmpty() &&
+                        method.returnType == Int::class.javaPrimitiveType
+                }
+        }.firstOrNull()?.let { method ->
+            method.isAccessible = true
+            method.invoke(context) as? Int
+        } ?: 0
+    }.getOrElse {
+        return generateSequence<Class<*>>(context.javaClass) { current ->
+            current.superclass
+        }.mapNotNull { clazz ->
+            runCatching { clazz.getDeclaredField("mThemeResource") }.getOrNull()
+        }.firstNotNullOfOrNull { field ->
+            field.isAccessible = true
+            field.get(context) as? Int
+        } ?: 0
+    }
 }
 
 private fun Any.writeField(fieldName: String, value: Any?) {

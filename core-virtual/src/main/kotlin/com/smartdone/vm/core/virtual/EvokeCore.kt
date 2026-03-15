@@ -7,6 +7,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.smartdone.vm.core.virtual.data.EvokeAppRepository
@@ -60,6 +61,10 @@ class EvokeCore @Inject constructor(
     suspend fun launchApkUri(uri: Uri, userId: Int = 0): Boolean {
         val stagedLaunch = apkFileImporter.stageForLaunch(uri)
         val targetActivity = stagedLaunch.launcherActivity ?: return false
+        Log.i(
+            TAG,
+            "Launching staged APK package=${stagedLaunch.packageName} userId=$userId activity=$targetActivity apk=${stagedLaunch.baseApkPath}"
+        )
         val launchInfo = activityManagerService.startActivity(
             packageName = stagedLaunch.packageName,
             userId = userId,
@@ -349,6 +354,7 @@ class EvokeCore @Inject constructor(
     }
 
     companion object {
+        private const val TAG = "EvokeCore"
         const val EXTRA_PACKAGE_NAME = "extra_package_name"
         const val EXTRA_USER_ID = "extra_user_id"
         const val EXTRA_LABEL = "extra_label"

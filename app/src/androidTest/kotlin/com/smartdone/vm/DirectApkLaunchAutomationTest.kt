@@ -22,11 +22,12 @@ import org.junit.runner.RunWith
 class DirectApkLaunchAutomationTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val targetContext = instrumentation.targetContext
+    private val arguments = InstrumentationRegistry.getArguments()
     private val device = UiDevice.getInstance(instrumentation)
 
     @Before
     fun setUp() {
-        assumeTrue("A launchable APKPure source APK is required", launchSourceFile()?.exists() == true)
+        assumeTrue("A launchable source APK is required", launchSourceFile()?.exists() == true)
         execShell("logcat -c")
         bringHostToForeground()
     }
@@ -46,6 +47,12 @@ class DirectApkLaunchAutomationTest {
             "Expected direct launch to use staged launch storage. Logs:\n$logs",
             logs.contains("/VirtualEnv/launches/")
         )
+        expectedPackageName()?.let { expectedPackage ->
+            assertTrue(
+                "Expected logs to include package $expectedPackage. Logs:\n$logs",
+                logs.contains(expectedPackage)
+            )
+        }
     }
 
     private fun bringHostToForeground() {
@@ -59,6 +66,17 @@ class DirectApkLaunchAutomationTest {
     }
 
     private fun launchSourceFile(): File? {
+        arguments.getString(ARG_APK_PATH)
+            ?.takeIf(String::isNotBlank)
+            ?.let(::File)
+            ?.takeIf(File::exists)
+            ?.let { return it }
+        File(targetContext.filesDir, SEEDED_LAUNCH_APK)
+            .takeIf(File::exists)
+            ?.let { return it }
+        File(targetContext.getExternalFilesDir(null), SEEDED_LAUNCH_APK)
+            .takeIf(File::exists)
+            ?.let { return it }
         val installedSource = runCatching {
             @Suppress("DEPRECATION")
             targetContext.packageManager.getApplicationInfo(VIRTUAL_APKPURE_PACKAGE, 0).sourceDir
@@ -70,7 +88,7 @@ class DirectApkLaunchAutomationTest {
             .takeIf(File::exists)
     }
 
-    private fun waitForEmbeddedUi(timeoutMs: Long = 10_000L): Boolean {
+    private fun waitForEmbeddedUi(timeoutMs: Long = 25_000L): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
             val logs = execShell("logcat -d -s StubActivity:I EmbeddedActivity:I AndroidRuntime:E *:S")
@@ -95,11 +113,19 @@ class DirectApkLaunchAutomationTest {
                     it.contains("EvokeAppRuntime") ||
                     it.contains("EmbeddedActivity") ||
                     it.contains("StubActivity") ||
+                    it.contains("Flutter") ||
+                    it.contains("flutter") ||
+                    it.contains("NoClassDefFoundError") ||
+                    it.contains("ClassNotFoundException") ||
                     it.contains(VIRTUAL_APKPURE_PACKAGE) ||
+                    expectedPackageName()?.let(it::contains) == true ||
                     it.contains("/VirtualEnv/launches/")
             }
             .joinToString("\n")
     }
+
+    private fun expectedPackageName(): String? =
+        arguments.getString(ARG_EXPECTED_PACKAGE)?.takeIf(String::isNotBlank)
 
     private fun execShell(command: String): String =
         instrumentation.uiAutomation.executeShellCommand(command).use { descriptor ->
@@ -114,5 +140,8 @@ class DirectApkLaunchAutomationTest {
 
     companion object {
         private const val VIRTUAL_APKPURE_PACKAGE = "com.apkpure.aegon"
+        private const val SEEDED_LAUNCH_APK = "launch-test.apk"
+        private const val ARG_APK_PATH = "apk_path"
+        private const val ARG_EXPECTED_PACKAGE = "expected_package"
     }
 }

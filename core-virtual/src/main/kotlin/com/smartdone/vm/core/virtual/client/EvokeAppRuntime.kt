@@ -50,6 +50,13 @@ data class EvokeAppRuntimeSession(
     val optimizedDir: String
 )
 
+data class PreferredThemeResolution(
+    val themeResId: Int,
+    val themeContext: Context? = null,
+    val sourceClassName: String? = null,
+    val sourceMethodName: String? = null
+)
+
 @Singleton
 class EvokeAppRuntime @Inject constructor(
     private val repository: EvokeAppRepository,
@@ -57,7 +64,13 @@ class EvokeAppRuntime @Inject constructor(
     private val apkParser: ApkParser
 ) {
     private var bootstrappedApp: BootstrappedApp? = null
+    private val guestBridgeClassCache = ConcurrentHashMap<String, List<String>>()
     private val contextSingletonWarmupCache = ConcurrentHashMap<String, List<String>>()
+    private val startupBridgeClassCache = ConcurrentHashMap<String, List<String>>()
+    private val singletonRepairClassCache = ConcurrentHashMap<String, List<String>>()
+    private val themeWrapperRepairClassCache = ConcurrentHashMap<String, List<String>>()
+    private val interfaceInjectorRepairClassCache = ConcurrentHashMap<String, List<String>>()
+    private val staticRuntimeInitializerClassCache = ConcurrentHashMap<String, List<String>>()
 
     fun createSession(
         context: Context,
@@ -80,9 +93,7 @@ class EvokeAppRuntime @Inject constructor(
             "com.smartdone.vm.core.virtual.client.hook.PermissionHook",
             "com.smartdone.vm.core.virtual.client.hook.DeviceInfoHook",
             "com.smartdone.vm.core.virtual.client.hook.ContextHook",
-            "com.smartdone.vm.core.virtual.client.EvokeAppClient",
-            "lh.f",
-            "ph.c0"
+            "com.smartdone.vm.core.virtual.client.EvokeAppClient"
         )
         sandboxPath.ensureAppStructure(packageName, userId)
         sandboxPath.sealArchiveIfManaged(apkPath)
@@ -204,6 +215,61 @@ class EvokeAppRuntime @Inject constructor(
             applicationContextOverride?.let(appContext::setVirtualApplicationContext)
         }
 
+    fun resolvePreferredTheme(
+        session: EvokeAppRuntimeSession,
+        fallbackThemeResId: Int
+    ): PreferredThemeResolution {
+        val primaryPackagePrefixes = resolvePrimaryGuestRepairPackagePrefixes(session)
+        resolveThemeWrapperRepairClassNames(session)
+            .asSequence()
+            .filter { className ->
+                shouldConsiderPrimaryGuestRepairClass(
+                    className = className,
+                    primaryPackagePrefixes = primaryPackagePrefixes
+                )
+            }
+            .forEach { className ->
+                val resolution = runCatching {
+                    val clazz = session.evokeAppClassLoader.loadClass(className)
+                    val wrapperResolution = resolvePreferredThemeWrapper(clazz)
+                        ?: return@runCatching null
+                    val resolvedThemeResId = resolveThemeResId(wrapperResolution.context)
+                    val selectedThemeResId = resolvedThemeResId
+                        ?.takeIf { it != 0 }
+                        ?: fallbackThemeResId
+                    Log.i(
+                        TAG,
+                        "Resolved preferred theme wrapper class=$className method=${wrapperResolution.methodName} " +
+                            "wrapper=${wrapperResolution.context.javaClass.name} " +
+                            "wrapperTheme=0x${(resolvedThemeResId ?: 0).toString(16)} " +
+                            "selectedTheme=0x${selectedThemeResId.toString(16)}"
+                    )
+                    PreferredThemeResolution(
+                        themeResId = selectedThemeResId,
+                        themeContext = wrapperResolution.context,
+                        sourceClassName = className,
+                        sourceMethodName = wrapperResolution.methodName
+                    )
+                }.onFailure {
+                    Log.d(TAG, "Unable to resolve preferred theme wrapper $className", it)
+                }.getOrNull()
+                if (resolution != null) {
+                    return resolution
+                }
+            }
+        Log.i(
+            TAG,
+            "Falling back to manifest theme for ${session.packageName} " +
+                "theme=0x${fallbackThemeResId.toString(16)}"
+        )
+        return PreferredThemeResolution(themeResId = fallbackThemeResId)
+    }
+
+    fun resolvePreferredThemeResId(
+        session: EvokeAppRuntimeSession,
+        fallbackThemeResId: Int
+    ): Int = resolvePreferredTheme(session, fallbackThemeResId).themeResId
+
     private fun attachBaseContext(target: Any, context: Context) {
         val attachMethod: Method = generateSequence(target.javaClass) { it.superclass }
             .mapNotNull { clazz ->
@@ -249,100 +315,84 @@ class EvokeAppRuntime @Inject constructor(
         }
     }
 
-    private fun primeApplicationLikeStatics(
-        application: Application,
-        session: EvokeAppRuntimeSession
+    private fun primeGuestBridgeStatics(
+        context: Context,
+        session: EvokeAppRuntimeSession,
+        application: Application? = null
     ) {
-        val classLoader = session.evokeAppClassLoader
-        val candidates = listOf(
-            "com.tencent.crabshell.b",
-            "com.apkpure.aegon.application.RealApplicationLike"
-        )
-        candidates.forEach { className ->
-            runCatching {
-                val clazz = classLoader.loadClass(className)
-                updateStaticFieldIfPresent(clazz, "application", application)
-                updateStaticFieldIfPresent(clazz, "mApplication", application)
-                updateStaticFieldIfPresent(clazz, "mContext", application)
-                updateStaticFieldIfPresent(clazz, "context", application)
-                if (className == "com.apkpure.aegon.application.RealApplicationLike") {
-                    updateStaticFieldIfPresent(clazz, "channelConfig", null)
-                }
-                val instance = runCatching {
-                    clazz.getDeclaredMethod("getInstance").invoke(null)
-                }.getOrNull() ?: return@runCatching
-                val attachMethods = listOf(
-                    clazz.methods.firstOrNull {
-                        it.name == "attachBaseContext" &&
-                            it.parameterTypes.contentEquals(arrayOf(Application::class.java))
-                    },
-                    clazz.methods.firstOrNull {
-                        it.name == "attachBaseContext" &&
-                            it.parameterTypes.contentEquals(arrayOf(Context::class.java))
-                    }
+        val handles = resolveGuestBridgeHandles(session)
+        if (handles.isEmpty()) {
+            Log.d(TAG, "No guest bridge candidates found for ${session.packageName}")
+            return
+        }
+        var touchedCount = 0
+        handles.forEach { handle ->
+            val touched = runCatching {
+                val updatedFields = updateGuestBridgeStaticFields(
+                    clazz = handle.clazz,
+                    application = application,
+                    context = context
                 )
-                attachMethods.firstOrNull()?.let { method ->
-                    method.isAccessible = true
-                    val arg = if (method.parameterTypes.first() == Application::class.java) {
-                        application
-                    } else {
-                        application.applicationContext
-                    }
-                    method.invoke(instance, arg)
-                    Log.i(TAG, "Primed application-like context via ${clazz.name}.${method.name}")
+                val attached = invokeGuestBridgeAttach(
+                    handle = handle,
+                    application = application,
+                    context = context
+                )
+                if (updatedFields > 0 || attached) {
+                    Log.i(
+                        TAG,
+                        "Primed guest bridge ${handle.className} for ${session.packageName} " +
+                            "updatedFields=$updatedFields attached=$attached"
+                    )
+                    true
+                } else {
+                    false
                 }
             }.onFailure {
-                Log.d(TAG, "Skipping application-like priming for $className", it)
+                Log.d(TAG, "Skipping guest bridge priming for ${handle.className}", it)
+            }.getOrDefault(false)
+            if (touched) {
+                touchedCount += 1
             }
+        }
+        if (touchedCount > 0) {
+            Log.i(TAG, "Guest bridge priming complete for ${session.packageName} touched=$touchedCount")
         }
     }
 
-    private fun initializeApplicationLikeRuntime(
+    private fun initializeGuestBridgeRuntime(
         application: Application,
         session: EvokeAppRuntimeSession
     ) {
-        val classLoader = session.evokeAppClassLoader
-        val applicationLikeCreated = runCatching {
-            val realApplicationLikeClass =
-                classLoader.loadClass("com.apkpure.aegon.application.RealApplicationLike")
-            val instance = realApplicationLikeClass.getDeclaredMethod("getInstance").invoke(null)
-                ?: return@runCatching false
-            realApplicationLikeClass.getDeclaredMethod("onCreate", Application::class.java).apply {
-                isAccessible = true
-                invoke(instance, application)
+        val handles = resolveGuestBridgeHandles(session)
+        var initializedCount = 0
+        handles.forEach { handle ->
+            val initialized = runCatching {
+                val invokedMethods = invokeGuestBridgeLifecycleMethods(
+                    handle = handle,
+                    application = application
+                )
+                if (invokedMethods.isNotEmpty()) {
+                    Log.i(
+                        TAG,
+                        "Initialized guest bridge ${handle.className} for ${session.packageName} " +
+                            "methods=${invokedMethods.joinToString()}"
+                    )
+                    true
+                } else {
+                    false
+                }
+            }.onFailure {
+                Log.d(TAG, "Skipping guest bridge initialization for ${handle.className}", it)
+            }.getOrDefault(false)
+            if (initialized) {
+                initializedCount += 1
             }
-            Log.i(TAG, "Invoked RealApplicationLike.onCreate for ${session.packageName}")
-            true
-        }.getOrElse {
-            Log.d(TAG, "Skipping application-like onCreate bridge for ${session.packageName}", it)
-            false
         }
-        runCatching {
-            val networkRuntimeClass = classLoader.loadClass("com.apkpure.aegon.network.h")
-            networkRuntimeClass.getDeclaredMethod("a", Context::class.java).apply {
-                isAccessible = true
-                invoke(null, application)
-            }
-            Log.i(TAG, "Initialized application-like network runtime for ${session.packageName}")
-        }.onFailure {
-            Log.d(TAG, "Skipping application-like network init for ${session.packageName}", it)
-        }
-        ensureApkPureClientChannelReady(
-            classLoader = classLoader,
-            packageName = session.packageName,
-            forceInit = !applicationLikeCreated
-        )
         warmContextBackedSingletons(
             application = application,
             session = session
         )
-        runCatching {
-            val clientChannelClass = classLoader.loadClass("bd.h\$b")
-            val ready = clientChannelClass.getDeclaredMethod("c").invoke(null) as? Boolean ?: false
-            Log.i(TAG, "Client channel ready=$ready for ${session.packageName}")
-        }.onFailure {
-            Log.d(TAG, "Unable to inspect client channel readiness for ${session.packageName}", it)
-        }
         runCatching {
             val activityThreadClass = Class.forName("android.app.ActivityThread")
             val currentActivityThread = activityThreadClass
@@ -354,38 +404,293 @@ class EvokeAppRuntime @Inject constructor(
             }.get(currentActivityThread)
             Log.d(
                 TAG,
-                "Application-like runtime ready package=${session.packageName} " +
-                    "application=${application.javaClass.name} instrumentation=${instrumentation?.javaClass?.name}"
+                "Guest bridge runtime ready package=${session.packageName} " +
+                    "application=${application.javaClass.name} instrumentation=${instrumentation?.javaClass?.name} " +
+                    "bridges=$initializedCount"
             )
         }.onFailure {
-            Log.d(TAG, "Unable to inspect application-like runtime for ${session.packageName}", it)
+            Log.d(TAG, "Unable to inspect guest bridge runtime for ${session.packageName}", it)
         }
     }
 
-    private fun ensureApkPureClientChannelReady(
-        classLoader: ClassLoader,
-        packageName: String,
-        forceInit: Boolean
-    ) {
-        runCatching {
-            val clientChannelCompanionClass = classLoader.loadClass("bd.h\$b")
-            val ready = clientChannelCompanionClass.getDeclaredMethod("c").invoke(null) as? Boolean ?: false
-            if (ready && !forceInit) {
-                Log.i(TAG, "Client channel already ready for $packageName")
-                return
+    private fun resolveGuestBridgeHandles(
+        session: EvokeAppRuntimeSession
+    ): List<GuestBridgeHandle> =
+        resolveGuestBridgeClassNames(session).mapNotNull { className ->
+            runCatching {
+                val clazz = session.evokeAppClassLoader.loadClass(className)
+                GuestBridgeHandle(
+                    className = className,
+                    clazz = clazz,
+                    instance = if (requiresGuestBridgeInstance(clazz)) {
+                        resolveGuestBridgeInstance(clazz)
+                    } else {
+                        null
+                    }
+                )
+            }.onFailure {
+                Log.d(TAG, "Unable to resolve guest bridge handle for $className", it)
+            }.getOrNull()
+        }
+
+    private fun resolveGuestBridgeClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        guestBridgeClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
             }
-            val realApplicationLikeClass =
-                classLoader.loadClass("com.apkpure.aegon.application.RealApplicationLike")
-            realApplicationLikeClass.getDeclaredMethod("initClientChannel").apply {
-                isAccessible = true
-                invoke(null)
+        ) {
+            val primaryPackagePrefixes = resolvePrimaryGuestRepairPackagePrefixes(session)
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    shouldConsiderPrimaryGuestRepairClass(
+                        className = className,
+                        primaryPackagePrefixes = primaryPackagePrefixes
+                    )
+                }
+                .filter { className ->
+                    runCatching {
+                        val clazz = session.evokeAppClassLoader.loadClass(className)
+                        shouldConsiderGuestBridgeClass(clazz)
+                    }.getOrDefault(false)
+                }
+                .sortedWith(
+                    compareByDescending<String> { scoreGuestBridgeClassName(it) }
+                        .thenBy { it.length }
+                        .thenBy { it }
+                )
+                .toList()
+        }
+
+    private fun shouldConsiderGuestBridgeClass(clazz: Class<*>): Boolean {
+        if (clazz.isInterface || Modifier.isAbstract(clazz.modifiers)) return false
+        if (Application::class.java.isAssignableFrom(clazz)) return false
+        if (ContentProvider::class.java.isAssignableFrom(clazz)) return false
+        if (Activity::class.java.isAssignableFrom(clazz)) return false
+        if (isGuestUiInstantiationType(clazz)) return false
+        val hasAttach = clazz.methods.any(::isGuestBridgeAttachMethod)
+        val hasOnCreate = clazz.methods.any(::isGuestBridgeOnCreateMethod)
+        if (hasAttach || hasOnCreate) {
+            return true
+        }
+        return scoreGuestBridgeClassName(clazz.name) > 0 &&
+            clazz.methods.any(::isGuestBridgeLifecycleMethod) &&
+            clazz.declaredFields.any(::isGuestBridgeContextField)
+    }
+
+    private fun scoreGuestBridgeClassName(className: String): Int =
+        buildList {
+            if ("Application" in className) add(6)
+            if ("App" in className) add(3)
+            if ("Like" in className) add(4)
+            if ("Shell" in className) add(3)
+            if ("Runtime" in className) add(2)
+            if ("Client" in className) add(2)
+            if ("Channel" in className) add(2)
+            if ("Context" in className) add(2)
+        }.sum()
+
+    private fun resolveGuestBridgeInstance(clazz: Class<*>): Any? {
+        clazz.declaredFields.firstOrNull { field ->
+            Modifier.isStatic(field.modifiers) &&
+                !field.type.isPrimitive &&
+                field.name.equals("INSTANCE", ignoreCase = true)
+        }?.let { field ->
+            field.isAccessible = true
+            field.get(null)?.takeIf(clazz::isInstance)?.let { return it }
+        }
+        clazz.methods
+            .filter { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.parameterTypes.isEmpty() &&
+                    method.returnType != Void.TYPE &&
+                    (
+                        method.name.equals("getInstance", ignoreCase = true) ||
+                            method.name.equals("instance", ignoreCase = true) ||
+                            method.name.equals("current", ignoreCase = true) ||
+                            method.name.equals("singleton", ignoreCase = true)
+                        )
             }
-            Log.i(
-                TAG,
-                "Initialized application-like client channel for $packageName forceInit=$forceInit"
+            .sortedWith(
+                compareByDescending<Method> { it.name.equals("getInstance", ignoreCase = true) }
+                    .thenByDescending { it.name.equals("instance", ignoreCase = true) }
+                    .thenBy { it.name.length }
             )
-        }.onFailure {
-            Log.d(TAG, "Skipping application-like client channel init for $packageName", it)
+            .forEach { method ->
+                runCatching {
+                    method.isAccessible = true
+                    method.invoke(null)
+                }.getOrNull()?.takeIf(clazz::isInstance)?.let { return it }
+            }
+        return null
+    }
+
+    private fun requiresGuestBridgeInstance(clazz: Class<*>): Boolean =
+        clazz.methods.any { method ->
+            !Modifier.isStatic(method.modifiers) &&
+                (isGuestBridgeAttachMethod(method) || isGuestBridgeLifecycleMethod(method))
+        }
+
+    private fun updateGuestBridgeStaticFields(
+        clazz: Class<*>,
+        application: Application?,
+        context: Context
+    ): Int {
+        var updated = 0
+        generateSequence(clazz) { it.superclass }
+            .takeWhile { it != Any::class.java }
+            .flatMap { it.declaredFields.asSequence() }
+            .forEach { field ->
+                if (!Modifier.isStatic(field.modifiers) || Modifier.isFinal(field.modifiers)) {
+                    return@forEach
+                }
+                if (!isGuestBridgeContextField(field)) {
+                    return@forEach
+                }
+                val value = when {
+                    application != null && field.type.isInstance(application) -> application
+                    application != null && field.type.isAssignableFrom(Application::class.java) -> application
+                    field.type.isInstance(context) -> context
+                    field.type.isAssignableFrom(Context::class.java) -> context
+                    field.type.isAssignableFrom(ContextWrapper::class.java) -> context
+                    else -> return@forEach
+                }
+                runCatching {
+                    field.isAccessible = true
+                    val currentValue = field.get(null)
+                    if (currentValue !== value) {
+                        field.set(null, value)
+                        updated += 1
+                    }
+                }
+            }
+        return updated
+    }
+
+    private fun isGuestBridgeContextField(field: Field): Boolean {
+        if (field.type.isPrimitive) return false
+        val supportedType =
+            field.type.isAssignableFrom(Application::class.java) ||
+                field.type.isAssignableFrom(Context::class.java) ||
+                field.type.isAssignableFrom(ContextWrapper::class.java)
+        if (!supportedType) return false
+        val normalizedName = field.name.lowercase()
+        return normalizedName.contains("app") || normalizedName.contains("context")
+    }
+
+    private fun invokeGuestBridgeAttach(
+        handle: GuestBridgeHandle,
+        application: Application?,
+        context: Context
+    ): Boolean {
+        val method = handle.clazz.methods.firstOrNull(::isGuestBridgeAttachMethod) ?: return false
+        val args = resolveGuestBridgeArgs(
+            method = method,
+            application = application,
+            context = context
+        ) ?: return false
+        val receiver = if (Modifier.isStatic(method.modifiers)) null else handle.instance ?: return false
+        method.isAccessible = true
+        method.invoke(receiver, *args)
+        return true
+    }
+
+    private fun invokeGuestBridgeLifecycleMethods(
+        handle: GuestBridgeHandle,
+        application: Application
+    ): List<String> {
+        val invokedMethods = mutableListOf<String>()
+        handle.clazz.methods
+            .filter(::isGuestBridgeLifecycleMethod)
+            .sortedWith(
+                compareByDescending<Method> { it.name == "onCreate" }
+                    .thenByDescending { it.name.startsWith("init", ignoreCase = true) }
+                    .thenBy { it.name }
+                    .thenBy { it.parameterTypes.size }
+            )
+            .forEach { method ->
+                val args = resolveGuestBridgeArgs(
+                    method = method,
+                    application = application,
+                    context = application.applicationContext
+                ) ?: return@forEach
+                val receiver = if (Modifier.isStatic(method.modifiers)) {
+                    null
+                } else {
+                    handle.instance ?: return@forEach
+                }
+                runCatching {
+                    method.isAccessible = true
+                    method.invoke(receiver, *args)
+                    invokedMethods += method.name
+                }.onFailure {
+                    Log.v(
+                        TAG,
+                        "Guest bridge lifecycle invocation failed ${handle.className}.${method.name}",
+                        it
+                    )
+                }
+            }
+        return invokedMethods.distinct()
+    }
+
+    private fun isGuestBridgeAttachMethod(method: Method): Boolean =
+        method.name == "attachBaseContext" &&
+            method.returnType == Void.TYPE &&
+            method.parameterTypes.size == 1 &&
+            (
+                method.parameterTypes[0].isAssignableFrom(Context::class.java) ||
+                    method.parameterTypes[0].isAssignableFrom(Application::class.java) ||
+                    method.parameterTypes[0].isAssignableFrom(ContextWrapper::class.java)
+                )
+
+    private fun isGuestBridgeLifecycleMethod(method: Method): Boolean {
+        if (method.returnType != Void.TYPE) return false
+        if (method.parameterTypes.size > 1) return false
+        if (
+            method.parameterTypes.singleOrNull()?.let { parameterType ->
+                !parameterType.isAssignableFrom(Application::class.java) &&
+                    !parameterType.isAssignableFrom(Context::class.java) &&
+                    !parameterType.isAssignableFrom(ContextWrapper::class.java)
+            } == true
+        ) {
+            return false
+        }
+        return method.name == "onCreate" ||
+            method.name.startsWith("init", ignoreCase = true) ||
+            method.name.startsWith("initialize", ignoreCase = true) ||
+            method.name.startsWith("install", ignoreCase = true) ||
+            method.name.startsWith("setup", ignoreCase = true) ||
+            method.name.startsWith("start", ignoreCase = true) ||
+            method.name.startsWith("bootstrap", ignoreCase = true)
+    }
+
+    private fun isGuestBridgeOnCreateMethod(method: Method): Boolean =
+        method.name == "onCreate" && isGuestBridgeLifecycleMethod(method)
+
+    private fun resolveGuestBridgeArgs(
+        method: Method,
+        application: Application?,
+        context: Context
+    ): Array<Any?>? {
+        if (method.parameterTypes.isEmpty()) {
+            return emptyArray()
+        }
+        val parameterType = method.parameterTypes.single()
+        return when {
+            application != null && parameterType.isInstance(application) -> arrayOf(application)
+            application != null && parameterType.isAssignableFrom(Application::class.java) -> arrayOf(application)
+            parameterType.isInstance(context) -> arrayOf(context)
+            parameterType.isAssignableFrom(Context::class.java) -> arrayOf(context)
+            parameterType.isAssignableFrom(ContextWrapper::class.java) -> arrayOf(context)
+            else -> null
         }
     }
 
@@ -427,6 +732,167 @@ class EvokeAppRuntime @Inject constructor(
             "Context-backed singleton warmup complete for ${session.packageName} initialized=$initializedCount candidates=${candidateClassNames.size}"
         )
     }
+
+    private fun initializeStaticRuntimeModulesIfPresent(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        val candidateClassNames = resolveStaticRuntimeInitializerClassNames(session)
+        if (candidateClassNames.isEmpty()) {
+            Log.d(TAG, "No static runtime module initializers for ${session.packageName}")
+            return
+        }
+        var initializedCount = 0
+        candidateClassNames.forEach { className ->
+            val initialized = runCatching {
+                val clazz = session.evokeAppClassLoader.loadClass(className)
+                val method = clazz.methods
+                    .filter(::isSupportedStaticRuntimeInitializerMethod)
+                    .sortedWith(
+                        compareByDescending<Method> { scoreStaticRuntimeInitializerMethod(it) }
+                            .thenBy { it.name.length }
+                            .thenBy { it.name }
+                    )
+                    .firstOrNull()
+                    ?: return@runCatching false
+                val args = resolveGuestBridgeArgs(
+                    method = method,
+                    application = application,
+                    context = application.applicationContext
+                ) ?: return@runCatching false
+                method.isAccessible = true
+                method.invoke(null, *args)
+                Log.i(
+                    TAG,
+                    "Initialized static runtime module ${clazz.name}.${method.name} for ${session.packageName}"
+                )
+                true
+            }.onFailure {
+                Log.v(TAG, "Skipping static runtime module initializer $className", it)
+            }.getOrDefault(false)
+            if (initialized) {
+                initializedCount += 1
+            }
+        }
+        if (initializedCount > 0) {
+            Log.i(
+                TAG,
+                "Static runtime module initialization complete for ${session.packageName} initialized=$initializedCount"
+            )
+        }
+    }
+
+    private fun resolveStaticRuntimeInitializerClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        staticRuntimeInitializerClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
+            }
+        ) {
+            val primaryPackagePrefixes = resolvePrimaryGuestRepairPackagePrefixes(session)
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    shouldConsiderStaticRuntimeInitializerClass(
+                        className = className,
+                        primaryPackagePrefixes = primaryPackagePrefixes
+                    )
+                }
+                .mapNotNull { className ->
+                    runCatching {
+                        val clazz = session.evokeAppClassLoader.loadClass(className)
+                        className.takeIf { shouldInitializeStaticRuntimeModule(clazz) }
+                    }.onFailure {
+                        Log.v(TAG, "Skipping static runtime module scan for $className", it)
+                    }.getOrNull()
+                }
+                .sortedWith(
+                    compareByDescending<String> { scoreStaticRuntimeInitializerClassName(it) }
+                        .thenBy { it.length }
+                        .thenBy { it }
+                )
+                .toList()
+        }
+
+    private fun shouldConsiderStaticRuntimeInitializerClass(
+        className: String,
+        primaryPackagePrefixes: Set<String>
+    ): Boolean {
+        if ('$' in className) return false
+        if (className.endsWith(".BuildConfig")) return false
+        if (className.endsWith(".R")) return false
+        if (className.contains(".R$")) return false
+        if (primaryPackagePrefixes.none { prefix -> className == prefix || className.startsWith("$prefix.") }) {
+            return false
+        }
+        val normalizedName = className.lowercase()
+        return STATIC_RUNTIME_INITIALIZER_PACKAGE_KEYWORDS.any(normalizedName::contains)
+    }
+
+    private fun shouldInitializeStaticRuntimeModule(clazz: Class<*>): Boolean {
+        if (clazz.isInterface || Modifier.isAbstract(clazz.modifiers)) return false
+        if (Application::class.java.isAssignableFrom(clazz)) return false
+        if (ContentProvider::class.java.isAssignableFrom(clazz)) return false
+        if (Activity::class.java.isAssignableFrom(clazz)) return false
+        if (isGuestUiInstantiationType(clazz)) return false
+        if (clazz.declaredFields.any { !Modifier.isStatic(it.modifiers) }) return false
+        if (
+            clazz.declaredFields.any { field ->
+                Modifier.isStatic(field.modifiers) && !Modifier.isFinal(field.modifiers)
+            }
+        ) {
+            return false
+        }
+        return clazz.methods.any(::isSupportedStaticRuntimeInitializerMethod)
+    }
+
+    private fun isSupportedStaticRuntimeInitializerMethod(method: Method): Boolean {
+        if (!Modifier.isStatic(method.modifiers) || method.returnType != Void.TYPE) {
+            return false
+        }
+        if (method.parameterTypes.size != 1 || method.isSynthetic) {
+            return false
+        }
+        val parameterType = method.parameterTypes.single()
+        if (
+            !parameterType.isAssignableFrom(Application::class.java) &&
+            !parameterType.isAssignableFrom(Context::class.java) &&
+            !parameterType.isAssignableFrom(ContextWrapper::class.java)
+        ) {
+            return false
+        }
+        return method.name in STATIC_RUNTIME_INITIALIZER_METHOD_NAMES ||
+            (
+                method.name.length <= 2 &&
+                    method.declaringClass.simpleName.length <= 4
+                )
+    }
+
+    private fun scoreStaticRuntimeInitializerClassName(className: String): Int {
+        val normalizedName = className.lowercase()
+        return buildList {
+            if (".network." in normalizedName) add(8)
+            if (".channel." in normalizedName) add(6)
+            if (".runtime." in normalizedName) add(5)
+            if (".startup." in normalizedName) add(5)
+            if (".service." in normalizedName) add(4)
+            if (".sdk." in normalizedName) add(3)
+            if (".core." in normalizedName) add(2)
+        }.sum()
+    }
+
+    private fun scoreStaticRuntimeInitializerMethod(method: Method): Int =
+        buildList {
+            if (method.name in STATIC_RUNTIME_INITIALIZER_METHOD_NAMES) add(6)
+            if (method.name.length <= 2) add(3)
+            if (method.parameterTypes.singleOrNull()?.isAssignableFrom(Application::class.java) == true) add(2)
+        }.sum()
 
     private fun resolveContextSingletonWarmupCandidates(
         session: EvokeAppRuntimeSession
@@ -520,20 +986,6 @@ class EvokeAppRuntime @Inject constructor(
         }
     }
 
-    private fun updateStaticFieldIfPresent(
-        clazz: Class<*>,
-        fieldName: String,
-        value: Any?
-    ) {
-        runCatching {
-            clazz.getDeclaredField(fieldName).apply {
-                isAccessible = true
-                set(null, value)
-            }
-            Log.d(TAG, "Updated ${clazz.name}.$fieldName")
-        }
-    }
-
     private fun createResources(
         context: Context,
         apkPath: String,
@@ -578,8 +1030,61 @@ class EvokeAppRuntime @Inject constructor(
     }
 
     companion object {
+        private const val ANDROIDX_CONTEXT_THEME_WRAPPER_CLASS_NAME =
+            "androidx.appcompat.view.ContextThemeWrapper"
         private const val TAG = "EvokeAppRuntime"
-        private const val APKPURE_PACKAGE_NAME = "com.apkpure.aegon"
+        private val STARTUP_BRIDGE_CREATE_METHODS = setOf(
+            "mainCreate",
+            "ioCreate",
+            "idleCreate",
+            "delayCreate"
+        )
+        private val SINGLETON_REPAIR_ACCESSOR_METHOD_NAMES = setOf(
+            "getInstance",
+            "instance",
+            "f"
+        )
+        private val SINGLETON_REPAIR_INIT_METHOD_NAMES = setOf(
+            "init",
+            "initialize",
+            "h"
+        )
+        private val THEME_WRAPPER_REPAIR_INIT_METHOD_NAMES = setOf(
+            "a",
+            "init",
+            "initialize"
+        )
+        private val GUEST_CONTEXT_INITIALIZER_METHOD_NAMES = setOf(
+            "init",
+            "initialize",
+            "setup",
+            "attach",
+            "inject",
+            "install",
+            "setContext",
+            "setApplication",
+            "setApp",
+            "setEnv"
+        )
+        private val STATIC_RUNTIME_INITIALIZER_METHOD_NAMES = setOf(
+            "init",
+            "initialize",
+            "setup",
+            "install",
+            "attach",
+            "start",
+            "bootstrap",
+            "register"
+        )
+        private val STATIC_RUNTIME_INITIALIZER_PACKAGE_KEYWORDS = setOf(
+            ".network.",
+            ".channel.",
+            ".runtime.",
+            ".startup.",
+            ".service.",
+            ".sdk.",
+            ".core."
+        )
         private val CONTEXT_SINGLETON_ARGUMENT_TYPES = listOf(
             Context::class.java,
             Application::class.java,
@@ -587,13 +1092,158 @@ class EvokeAppRuntime @Inject constructor(
         )
         private val CONTEXT_SINGLETON_OBFUSCATED_CLASS_NAME =
             Regex("^[a-z][a-z0-9]{0,2}(\\.[A-Za-z][A-Za-z0-9_$]{0,2}){1,3}$")
-        private val APKPURE_SKIPPED_PROVIDER_CLASSES = setOf(
-            "androidx.core.content.FileProvider",
-            "com.apkmatrix.components.downloader.utils.DownloaderFileProvider",
-            "com.just.agentweb.AgentWebFileProvider",
-            "com.luck.picture.lib.basic.PictureFileProvider",
-            "com.apicfast.sdk.ad.bridge.BridgeProvider",
-            "com.apicfast.sdk.ad.provider.AdProvider"
+        private val INTERFACE_INJECTOR_OBFUSCATED_CLASS_NAME =
+            Regex("^[a-z][a-z0-9]{0,2}(\\.[A-Za-z][A-Za-z0-9_$]{0,5}){1,2}$")
+        private val THEME_WRAPPER_OBFUSCATED_CLASS_NAME =
+            Regex("^[a-z][a-z0-9]{0,2}\\.[A-Za-z][A-Za-z0-9_$]{0,5}$")
+    }
+
+    private fun bootstrapGuestApplication(
+        applicationContext: EvokeAppContext,
+        session: EvokeAppRuntimeSession
+    ): GuestApplicationBootstrapResult {
+        primeGuestBridgeStatics(
+            context = applicationContext,
+            session = session
+        )
+        val applicationClassName = session.applicationClassName
+        if (applicationClassName.isNullOrBlank()) {
+            Log.w(TAG, "Manifest application class missing for ${session.packageName}; using base Application")
+            return bootstrapFallbackApplication(
+                applicationContext = applicationContext,
+                session = session,
+                status = "missing"
+            )
+        }
+        var lastFailure: Throwable? = null
+        repeat(2) { attempt ->
+            val attemptLabel = if (attempt == 0) "initial" else "retry"
+            val created = runCatching {
+                val appClass = session.evokeAppClassLoader.loadClass(applicationClassName)
+                val constructor = appClass.getDeclaredConstructor().apply {
+                    isAccessible = true
+                }
+                constructor.newInstance() as Application
+            }.onFailure { throwable ->
+                val cause = rootCause(throwable)
+                lastFailure = throwable
+                Log.w(
+                    TAG,
+                    "Unable to create virtual application $applicationClassName for ${session.packageName} " +
+                        "attempt=$attemptLabel cause=${cause.javaClass.name}: ${cause.message}",
+                    throwable
+                )
+            }.getOrNull()
+            if (created != null) {
+                return completeGuestApplicationBootstrap(
+                    created = created,
+                    applicationContext = applicationContext,
+                    session = session,
+                    status = "created:${created::class.java.name}"
+                )
+            }
+            if (attempt == 0 && shouldRetryGuestApplicationCreation(lastFailure)) {
+                primeGuestBridgeStatics(
+                    context = applicationContext,
+                    session = session
+                )
+            }
+        }
+        return bootstrapFallbackApplication(
+            applicationContext = applicationContext,
+            session = session,
+            status = "failed:${rootCause(lastFailure).javaClass.simpleName}"
+        )
+    }
+
+    private fun completeGuestApplicationBootstrap(
+        created: Application,
+        applicationContext: EvokeAppContext,
+        session: EvokeAppRuntimeSession,
+        status: String
+    ): GuestApplicationBootstrapResult {
+        val applicationClass = created.javaClass
+        Log.i(
+            TAG,
+            "Bootstrapping guest application package=${session.packageName} " +
+                "class=${applicationClass.name} " +
+                "attachBaseContextOverride=${declaresApplicationAttachBaseContext(applicationClass)} " +
+                "onCreateOverride=${declaresApplicationOnCreate(applicationClass)}"
+        )
+        attachApplication(created, applicationContext)
+        Log.i(TAG, "Attached guest application ${applicationClass.name} for ${session.packageName}")
+        registerApplicationWithActivityThread(created)
+        applicationContext.setVirtualApplicationContext(created)
+        primeGuestBridgeStatics(
+            context = applicationContext,
+            session = session,
+            application = created
+        )
+        installContentProvidersIfNeeded(created, session)
+        initializeMmkvIfPresent(created, session)
+        Log.i(TAG, "Calling Application.onCreate for ${applicationClass.name} package=${session.packageName}")
+        created.onCreate()
+        Log.i(TAG, "Completed Application.onCreate for ${applicationClass.name} package=${session.packageName}")
+        initializeGuestBridgeRuntime(created, session)
+        initializeStaticRuntimeModulesIfPresent(created, session)
+        scheduleDeferredGuestRepairs(created, session)
+        return GuestApplicationBootstrapResult(
+            application = created,
+            status = status
+        )
+    }
+
+    private fun bootstrapFallbackApplication(
+        applicationContext: EvokeAppContext,
+        session: EvokeAppRuntimeSession,
+        status: String
+    ): GuestApplicationBootstrapResult =
+        completeGuestApplicationBootstrap(
+            created = Application(),
+            applicationContext = applicationContext,
+            session = session,
+            status = status
+        )
+
+    private fun declaresApplicationAttachBaseContext(applicationClass: Class<*>): Boolean =
+        generateSequence(applicationClass) { current ->
+            current.superclass?.takeUnless { it == Application::class.java }
+        }.any { clazz ->
+            runCatching {
+                clazz.getDeclaredMethod("attachBaseContext", Context::class.java)
+            }.isSuccess
+        }
+
+    private fun declaresApplicationOnCreate(applicationClass: Class<*>): Boolean =
+        generateSequence(applicationClass) { current ->
+            current.superclass?.takeUnless { it == Application::class.java }
+        }.any { clazz ->
+            runCatching {
+                clazz.getDeclaredMethod("onCreate")
+            }.isSuccess
+        }
+
+    private fun shouldRetryGuestApplicationCreation(throwable: Throwable?): Boolean {
+        val cause = rootCause(throwable)
+        return cause is ClassNotFoundException ||
+            cause is NoClassDefFoundError ||
+            cause is UnsatisfiedLinkError ||
+            cause is ExceptionInInitializerError
+    }
+
+    private fun rootCause(throwable: Throwable?): Throwable =
+        generateSequence(throwable) { current ->
+            current.cause?.takeUnless { it === current }
+        }.lastOrNull() ?: IllegalStateException("unknown")
+
+    private fun scheduleDeferredGuestRepairs(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        Log.i(
+            TAG,
+            "Skipping deferred guest repair heuristics during launch for ${session.packageName} " +
+                "application=${application.javaClass.name}"
         )
     }
 
@@ -606,51 +1256,17 @@ class EvokeAppRuntime @Inject constructor(
             session = session,
             reportedPackageNameOverride = context.applicationContext.packageName
         )
-        val application = session.applicationClassName?.let { applicationClassName ->
-            runCatching {
-                val appClass = session.evokeAppClassLoader.loadClass(applicationClassName)
-                val created = appClass.getDeclaredConstructor().newInstance() as Application
-                attachApplication(created, applicationContext)
-                registerApplicationWithActivityThread(created)
-                applicationContext.setVirtualApplicationContext(created)
-                primeApplicationLikeStatics(created, session)
-                installContentProvidersIfNeeded(applicationContext, session)
-                initializeFirebaseIfPresent(created, session)
-                created.onCreate()
-                initializeApplicationLikeRuntime(created, session)
-                created to "created:${created::class.java.name}"
-            }.getOrElse {
-                Log.w(TAG, "Unable to create virtual application $applicationClassName", it)
-                val created = Application()
-                attachApplication(created, applicationContext)
-                registerApplicationWithActivityThread(created)
-                applicationContext.setVirtualApplicationContext(created)
-                primeApplicationLikeStatics(created, session)
-                installContentProvidersIfNeeded(applicationContext, session)
-                initializeFirebaseIfPresent(created, session)
-                created.onCreate()
-                initializeApplicationLikeRuntime(created, session)
-                created to "failed:${it.javaClass.simpleName}"
-            }
-        } ?: run {
-            val created = Application()
-            attachApplication(created, applicationContext)
-            registerApplicationWithActivityThread(created)
-            applicationContext.setVirtualApplicationContext(created)
-            primeApplicationLikeStatics(created, session)
-            installContentProvidersIfNeeded(applicationContext, session)
-            initializeFirebaseIfPresent(created, session)
-            created.onCreate()
-            initializeApplicationLikeRuntime(created, session)
-            created to "created:${created::class.java.name}"
-        }
+        val application = bootstrapGuestApplication(
+            applicationContext = applicationContext,
+            session = session
+        )
         return BootstrappedApp(
             packageName = session.packageName,
             userId = session.userId,
             apkPath = session.apkPath,
-            application = application.first,
+            application = application.application,
             applicationContext = applicationContext,
-            applicationStatus = application.second
+            applicationStatus = application.status
         )
     }
 
@@ -663,13 +1279,27 @@ class EvokeAppRuntime @Inject constructor(
         val applicationStatus: String
     )
 
+    private data class GuestApplicationBootstrapResult(
+        val application: Application,
+        val status: String
+    )
+
+    private data class GuestBridgeHandle(
+        val className: String,
+        val clazz: Class<*>,
+        val instance: Any?
+    )
+
     private fun installContentProvidersIfNeeded(
         context: Context,
         session: EvokeAppRuntimeSession
     ) {
         session.providerComponents.forEach { component ->
-            if (shouldSkipProviderInstallation(session, component)) {
-                Log.i(TAG, "Skipping virtual provider ${component.className} for ${session.packageName}")
+            if (!shouldInstallProviderEagerly(component)) {
+                Log.i(
+                    TAG,
+                    "Deferring virtual provider ${component.className} for ${session.packageName} authority=${component.authority}"
+                )
                 return@forEach
             }
             runCatching {
@@ -693,201 +1323,1149 @@ class EvokeAppRuntime @Inject constructor(
         }
     }
 
-    private fun shouldSkipProviderInstallation(
-        session: EvokeAppRuntimeSession,
-        component: ProviderComponentInfo
-    ): Boolean {
-        if (session.packageName != APKPURE_PACKAGE_NAME) return false
-        return component.className in APKPURE_SKIPPED_PROVIDER_CLASSES
+    private fun shouldInstallProviderEagerly(component: ProviderComponentInfo): Boolean {
+        val className = component.className.lowercase()
+        val authority = component.authority.lowercase()
+        return className == "androidx.startup.initializationprovider" ||
+            className.contains("firebaseinitprovider") ||
+            className.contains("initializationprovider") ||
+            className.contains("startupprovider") ||
+            authority.contains("firebaseinitprovider")
     }
 
-    private fun initializeFirebaseIfPresent(
-        context: Context,
+    private fun runStartupBridgesIfPresent(
+        application: Application,
         session: EvokeAppRuntimeSession
     ) {
-        if (session.packageName == APKPURE_PACKAGE_NAME) {
-            Log.i(TAG, "Skipping eager Firebase bootstrap for ${session.packageName}")
+        val startupBaseClass = runCatching {
+            session.evokeAppClassLoader.loadClass("com.rousetime.android_startup.AndroidStartup")
+        }.getOrElse {
+            Log.d(TAG, "Skipping startup bridge for ${session.packageName}: AndroidStartup unavailable")
             return
         }
-        runCatching {
-            val crashlyticsClass = session.evokeAppClassLoader.loadClass("lh.f")
-            val coreClass = session.evokeAppClassLoader.loadClass("ph.c0")
-            Log.i(
-                TAG,
-                "Crashlytics class bridge lh.f loader=${crashlyticsClass.classLoader} " +
-                    "source=${crashlyticsClass.protectionDomain?.codeSource?.location} " +
-                    "ph.c0 loader=${coreClass.classLoader}"
+        val startupClassNames = resolveStartupBridgeClassNames(session)
+        if (startupClassNames.isEmpty()) {
+            Log.d(TAG, "No guest startup bridge candidates for ${session.packageName}")
+            return
+        }
+        val startupInstances = linkedMapOf<String, Any>()
+        val executed = linkedSetOf<String>()
+        val visiting = linkedSetOf<String>()
+        var dispatchableCount = 0
+        startupClassNames.forEach { className ->
+            val startup = instantiateStartupBridge(
+                className = className,
+                application = application,
+                session = session
+            ) ?: return@forEach
+            startupInstances[className] = startup
+            if (!shouldDispatchStartupOnLaunch(startup)) {
+                return@forEach
+            }
+            dispatchableCount += 1
+            executeStartupBridgeRecursively(
+                className = className,
+                startup = startup,
+                startupBaseClass = startupBaseClass,
+                application = application,
+                startupContext = application.applicationContext,
+                session = session,
+                startupInstances = startupInstances,
+                visiting = visiting,
+                executed = executed
             )
-        }.onFailure {
-            Log.w(TAG, "Unable to inspect Crashlytics bridge classes for ${session.packageName}", it)
         }
-        val initialized = runCatching {
-            val firebaseAppClass = session.evokeAppClassLoader.loadClass("com.google.firebase.FirebaseApp")
-            val initializeMethod = firebaseAppClass.getMethod("initializeApp", Context::class.java)
-            initializeMethod.invoke(null, context)
-            Log.i(TAG, "Manually initialized FirebaseApp for ${session.packageName} via official class")
-            true
-        }.getOrElse {
-            Log.d(TAG, "Official FirebaseApp initialization path unavailable for ${session.packageName}", it)
-            false
-        }
-        if (initialized) return
-        runCatching {
-            val firebaseOptionsClass = session.evokeAppClassLoader.loadClass("eh.k")
-            val firebaseAppClass = session.evokeAppClassLoader.loadClass("eh.f")
-            val options = firebaseOptionsClass
-                .getMethod("a", Context::class.java)
-                .invoke(null, context)
-                ?: return@runCatching
-            firebaseAppClass
-                .getMethod("f", Context::class.java, firebaseOptionsClass)
-                .invoke(null, context, options)
-            Log.i(TAG, "Manually initialized FirebaseApp for ${session.packageName} via obfuscated classes")
-        }.onFailure {
-            Log.d(TAG, "Obfuscated FirebaseApp initialization skipped for ${session.packageName}", it)
-        }
-        repairFirebaseComponentRuntime(context, session)
+        Log.i(
+            TAG,
+            "Startup bridge complete for ${session.packageName} " +
+                "candidates=${startupClassNames.size} dispatchable=$dispatchableCount executed=${executed.size}"
+        )
     }
 
-    private fun repairFirebaseComponentRuntime(
+    private fun resolveStartupBridgeClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        startupBridgeClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
+            }
+        ) {
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    shouldConsiderStartupBridgeClass(className, session)
+                }
+                .toList()
+                .also { candidates ->
+                    if (candidates.isNotEmpty()) {
+                        Log.i(
+                            TAG,
+                            "Resolved startup bridge candidates for ${session.packageName}: ${candidates.joinToString()}"
+                        )
+                    }
+                }
+        }
+
+    private fun shouldConsiderStartupBridgeClass(
+        className: String,
+        session: EvokeAppRuntimeSession
+    ): Boolean {
+        if ('$' in className) return false
+        if (!className.endsWith("Startup")) return false
+        if (!className.contains(".startup.")) return false
+        if (className.startsWith("androidx.")) return false
+        if (className.startsWith("com.google.firebase.")) return false
+        if (className.startsWith("com.rousetime.android_startup.")) return false
+        return resolveStartupBridgePackagePrefixes(session).any { prefix ->
+            className == prefix || className.startsWith("$prefix.")
+        }
+    }
+
+    private fun resolveStartupBridgePackagePrefixes(
+        session: EvokeAppRuntimeSession
+    ): Set<String> =
+        buildSet {
+            addStartupBridgePackagePrefixes(session.packageName)
+            addStartupBridgePackagePrefixes(session.applicationClassName)
+            addStartupBridgePackagePrefixes(session.launcherActivity)
+            session.providerComponents.forEach { component ->
+                addStartupBridgePackagePrefixes(component.className)
+            }
+        }
+
+    private fun resolvePrimaryGuestRepairPackagePrefixes(
+        session: EvokeAppRuntimeSession
+    ): Set<String> =
+        buildSet {
+            addStartupBridgePackagePrefixes(session.packageName)
+            addStartupBridgePackagePrefixes(session.applicationClassName)
+            addStartupBridgePackagePrefixes(session.launcherActivity)
+        }
+
+    private fun shouldConsiderPrimaryGuestRepairClass(
+        className: String,
+        primaryPackagePrefixes: Set<String>
+    ): Boolean =
+        INTERFACE_INJECTOR_OBFUSCATED_CLASS_NAME.matches(className) ||
+            primaryPackagePrefixes.any { prefix ->
+                className == prefix || className.startsWith("$prefix.")
+            }
+
+    private fun MutableSet<String>.addStartupBridgePackagePrefixes(className: String?) {
+        if (className.isNullOrBlank()) return
+        val parts = className.split('.')
+        if (parts.size >= 2) {
+            add(parts.take(2).joinToString("."))
+        }
+        if (parts.size >= 3) {
+            add(parts.take(3).joinToString("."))
+        }
+        if (parts.size > 1) {
+            add(className.substringBeforeLast('.'))
+        }
+    }
+
+    private fun repairGuestSingletonManagersIfPresent(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        var repairedCount = 0
+        resolveSingletonRepairClassNames(session).forEach { className ->
+            val repaired = runCatching {
+                val clazz = session.evokeAppClassLoader.loadClass(className)
+                val singleton = resolveSingletonRepairInstance(clazz) ?: return@runCatching false
+                val getterMethods = clazz.methods.filter { method ->
+                    Modifier.isStatic(method.modifiers) &&
+                        method.parameterTypes.isEmpty() &&
+                        method.returnType != Void.TYPE &&
+                        !method.returnType.isPrimitive &&
+                        method.returnType != clazz
+                }
+                if (getterMethods.isEmpty()) {
+                    return@runCatching false
+                }
+                val nullGetters = getterMethods.filter { method ->
+                    runCatching { method.invoke(null) == null }.getOrDefault(false)
+                }
+                if (nullGetters.isEmpty()) {
+                    return@runCatching false
+                }
+                val initMethod = clazz.methods.firstOrNull { method ->
+                    !Modifier.isStatic(method.modifiers) &&
+                        method.name in SINGLETON_REPAIR_INIT_METHOD_NAMES &&
+                        method.returnType == Void.TYPE &&
+                        method.parameterTypes.size == 1 &&
+                        (
+                            method.parameterTypes[0].isInstance(application) ||
+                                method.parameterTypes[0].isAssignableFrom(application.javaClass) ||
+                                method.parameterTypes[0].isAssignableFrom(Application::class.java) ||
+                                method.parameterTypes[0].isAssignableFrom(Context::class.java)
+                            )
+                } ?: return@runCatching false
+                val arg = if (initMethod.parameterTypes[0].isAssignableFrom(Context::class.java)) {
+                    application.applicationContext
+                } else {
+                    application
+                }
+                initMethod.isAccessible = true
+                initMethod.invoke(singleton, arg)
+                val repairedGetters = nullGetters.filter { method ->
+                    runCatching { method.invoke(null) != null }.getOrDefault(false)
+                }
+                if (repairedGetters.isEmpty()) {
+                    return@runCatching false
+                }
+                Log.i(
+                    TAG,
+                    "Repaired guest singleton manager $className for ${session.packageName} " +
+                        "getters=${repairedGetters.joinToString { it.name }}"
+                )
+                true
+            }.onFailure {
+                Log.d(TAG, "Skipping guest singleton manager repair for $className", it)
+            }.getOrDefault(false)
+            if (repaired) {
+                repairedCount += 1
+            }
+        }
+        if (repairedCount > 0) {
+            Log.i(
+                TAG,
+                "Guest singleton manager repair complete for ${session.packageName} repaired=$repairedCount"
+            )
+        }
+    }
+
+    private fun resolveSingletonRepairClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        singletonRepairClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
+            }
+        ) {
+            val packagePrefixes = resolveStartupBridgePackagePrefixes(session)
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    '$' !in className &&
+                        !className.contains(".startup.") &&
+                        packagePrefixes.any { prefix -> className.startsWith("$prefix.") }
+                }
+                .toList()
+        }
+
+    private fun resolveSingletonRepairInstance(clazz: Class<*>): Any? {
+        clazz.declaredFields.firstOrNull { field ->
+            Modifier.isStatic(field.modifiers) &&
+                field.name == "INSTANCE" &&
+                clazz.isAssignableFrom(field.type)
+        }?.let { field ->
+            field.isAccessible = true
+            field.get(null)?.let { return it }
+        }
+        val accessor = clazz.methods.firstOrNull { method ->
+            Modifier.isStatic(method.modifiers) &&
+                method.parameterTypes.isEmpty() &&
+                method.returnType == clazz &&
+                method.name in SINGLETON_REPAIR_ACCESSOR_METHOD_NAMES
+        } ?: return null
+        return accessor.invoke(null)
+    }
+
+    private fun repairGuestThemeWrappersIfPresent(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        var repairedCount = 0
+        resolveThemeWrapperRepairClassNames(session).forEach { className ->
+            val repaired = runCatching {
+                val clazz = session.evokeAppClassLoader.loadClass(className)
+                val hasThemeField = clazz.declaredFields.any { field ->
+                    Modifier.isStatic(field.modifiers) &&
+                        field.type.name == ANDROIDX_CONTEXT_THEME_WRAPPER_CLASS_NAME
+                }
+                if (!hasThemeField) {
+                    return@runCatching false
+                }
+                val getterMethods = clazz.methods.filter { method ->
+                    Modifier.isStatic(method.modifiers) &&
+                        method.returnType.name == ANDROIDX_CONTEXT_THEME_WRAPPER_CLASS_NAME &&
+                        (
+                            method.parameterTypes.isEmpty() ||
+                                (
+                                    method.parameterTypes.size == 1 &&
+                                        (
+                                            method.parameterTypes[0] == Boolean::class.javaPrimitiveType ||
+                                                method.parameterTypes[0] == Boolean::class.javaObjectType
+                                            )
+                                    )
+                            )
+                }
+                if (getterMethods.isEmpty()) {
+                    return@runCatching false
+                }
+                val nullGetters = getterMethods.filter { method ->
+                    val args = when (method.parameterTypes.size) {
+                        0 -> emptyArray()
+                        else -> arrayOf(false)
+                    }
+                    runCatching { method.invoke(null, *args) == null }.getOrDefault(false)
+                }
+                if (nullGetters.isEmpty()) {
+                    return@runCatching false
+                }
+                val initMethod = clazz.methods.firstOrNull { method ->
+                    Modifier.isStatic(method.modifiers) &&
+                        method.name in THEME_WRAPPER_REPAIR_INIT_METHOD_NAMES &&
+                        method.returnType == Void.TYPE &&
+                        method.parameterTypes.firstOrNull()?.isAssignableFrom(Context::class.java) == true &&
+                        (
+                            method.parameterTypes.size == 1 ||
+                                (
+                                    method.parameterTypes.size == 2 &&
+                                        method.parameterTypes[1] == String::class.java
+                                    )
+                            )
+                } ?: return@runCatching false
+                val args = when (initMethod.parameterTypes.size) {
+                    1 -> arrayOf(application.applicationContext)
+                    2 -> arrayOf(application.applicationContext, "0")
+                    else -> return@runCatching false
+                }
+                initMethod.isAccessible = true
+                initMethod.invoke(null, *args)
+                val repairedGetters = nullGetters.filter { method ->
+                    val getterArgs = when (method.parameterTypes.size) {
+                        0 -> emptyArray()
+                        else -> arrayOf(false)
+                    }
+                    runCatching { method.invoke(null, *getterArgs) != null }.getOrDefault(false)
+                }
+                if (repairedGetters.isEmpty()) {
+                    return@runCatching false
+                }
+                Log.i(
+                    TAG,
+                    "Repaired guest theme wrappers $className for ${session.packageName} " +
+                        "getters=${repairedGetters.joinToString { it.name }}"
+                )
+                true
+            }.onFailure {
+                Log.d(TAG, "Skipping guest theme wrapper repair for $className", it)
+            }.getOrDefault(false)
+            if (repaired) {
+                repairedCount += 1
+            }
+        }
+        if (repairedCount > 0) {
+            Log.i(TAG, "Guest theme wrapper repair complete for ${session.packageName} repaired=$repairedCount")
+        }
+    }
+
+    private data class ThemeWrapperResolution(
+        val context: Context,
+        val methodName: String
+    )
+
+    private fun resolvePreferredThemeWrapper(clazz: Class<*>): ThemeWrapperResolution? {
+        val getterMethods = clazz.methods.filter { method ->
+            Modifier.isStatic(method.modifiers) &&
+                method.returnType.name == ANDROIDX_CONTEXT_THEME_WRAPPER_CLASS_NAME &&
+                (
+                    method.parameterTypes.isEmpty() ||
+                        (
+                            method.parameterTypes.size == 1 &&
+                                (
+                                    method.parameterTypes[0] == Boolean::class.javaPrimitiveType ||
+                                        method.parameterTypes[0] == Boolean::class.javaObjectType
+                                    )
+                            )
+                    )
+        }
+        getterMethods.forEach { method ->
+            val candidates = when (method.parameterTypes.size) {
+                0 -> listOf(emptyArray())
+                else -> listOf(arrayOf(false), arrayOf(true))
+            }
+            candidates.forEach { args ->
+                runCatching {
+                    method.isAccessible = true
+                    method.invoke(null, *args)
+                }.onFailure {
+                    Log.d(
+                        TAG,
+                        "Theme wrapper getter failed class=${clazz.name} method=${method.name} " +
+                            "args=${args.joinToString(prefix = "[", postfix = "]")}",
+                        it
+                    )
+                }.getOrNull()?.let { wrapper ->
+                    if (wrapper is Context) {
+                        Log.d(
+                            TAG,
+                            "Theme wrapper getter succeeded class=${clazz.name} method=${method.name} " +
+                                "args=${args.joinToString(prefix = "[", postfix = "]")} " +
+                                "wrapper=${wrapper.javaClass.name}"
+                        )
+                        return ThemeWrapperResolution(
+                            context = wrapper,
+                            methodName = method.name
+                        )
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun resolveThemeResId(context: Context): Int? {
+        runCatching {
+            return generateSequence<Class<*>>(context.javaClass) { current ->
+                current.superclass
+            }.flatMap { clazz ->
+                clazz.methods
+                    .asSequence()
+                    .filter { method ->
+                        method.name == "getThemeResId" &&
+                            method.parameterTypes.isEmpty() &&
+                            method.returnType == Int::class.javaPrimitiveType
+                    }
+            }.firstOrNull()?.let { method ->
+                method.isAccessible = true
+                method.invoke(context) as? Int
+            }
+        }.getOrElse { throwable ->
+            Log.d(TAG, "Method themeResId lookup failed for ${context.javaClass.name}", throwable)
+        }?.let { resolved ->
+            return resolved
+        }
+        return generateSequence<Class<*>>(context.javaClass) { current ->
+            current.superclass
+        }.mapNotNull { clazz ->
+            runCatching { clazz.getDeclaredField("mThemeResource") }.getOrNull()
+        }.firstNotNullOfOrNull { field ->
+            field.isAccessible = true
+            field.get(context) as? Int
+        }
+    }
+
+    private fun repairGuestContextInitializersIfPresent(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        val primaryPackagePrefixes = resolvePrimaryGuestRepairPackagePrefixes(session)
+        val candidateClassNames = resolveInterfaceInjectorRepairClassNames(session)
+            .filter { className ->
+                shouldConsiderPrimaryGuestRepairClass(
+                    className = className,
+                    primaryPackagePrefixes = primaryPackagePrefixes
+                )
+            }
+        if (candidateClassNames.isEmpty()) {
+            return
+        }
+        val loadedClasses = loadInterfaceInjectorRepairClasses(candidateClassNames, session)
+        val implementationsByInterface = buildInterfaceInjectorImplementationsByName(
+            loadedClasses = loadedClasses,
+            application = application
+        )
+        var repairedCount = 0
+        candidateClassNames
+            .sortedWith(
+                compareBy<String> { !INTERFACE_INJECTOR_OBFUSCATED_CLASS_NAME.matches(it) }
+                    .thenBy { it.length }
+                    .thenBy { it }
+            )
+            .forEach { className ->
+            val repaired = runCatching {
+                val clazz = session.evokeAppClassLoader.loadClass(className)
+                if (clazz.isInterface || Modifier.isAbstract(clazz.modifiers)) {
+                    return@runCatching false
+                }
+                if (isGuestUiInstantiationType(clazz)) {
+                    return@runCatching false
+                }
+                val initMethods = clazz.methods
+                    .filter(::isSupportedGuestContextInitializer)
+                    .filter { method ->
+                        resolveGuestContextInitializerArgs(
+                            method = method,
+                            application = application,
+                            implementationsByInterface = implementationsByInterface
+                        ) != null
+                    }
+                    .sortedWith(
+                        compareByDescending<Method> { it.parameterTypes.any(::isGuestContextLikeType) }
+                            .thenByDescending { it.parameterTypes.any(Class<*>::isInterface) }
+                            .thenBy { it.parameterTypes.size }
+                            .thenBy { it.name }
+                    )
+                if (initMethods.isEmpty()) {
+                    return@runCatching false
+                }
+                val instance = resolveGuestContextInitializerInstance(clazz) ?: return@runCatching false
+                val nullFieldsBefore = countGuestRepairableNullFields(clazz, instance)
+                if (nullFieldsBefore == 0) {
+                    return@runCatching false
+                }
+                val repairedMethods = mutableListOf<String>()
+                var remainingNullFields = nullFieldsBefore
+                initMethods.forEach { method ->
+                    val args = resolveGuestContextInitializerArgs(
+                        method = method,
+                        application = application,
+                        implementationsByInterface = implementationsByInterface
+                    ) ?: return@forEach
+                    if (remainingNullFields == 0) {
+                        return@forEach
+                    }
+                    runCatching {
+                        method.isAccessible = true
+                        method.invoke(instance, *args)
+                    }.onFailure {
+                        Log.v(
+                            TAG,
+                            "Guest context initializer invocation failed ${clazz.name}.${method.name}",
+                            it
+                        )
+                    }.getOrNull() ?: return@forEach
+                    val updatedNullFields = countGuestRepairableNullFields(clazz, instance)
+                    if (updatedNullFields < remainingNullFields) {
+                        repairedMethods += method.name
+                        remainingNullFields = updatedNullFields
+                    }
+                }
+                if (remainingNullFields >= nullFieldsBefore) {
+                    return@runCatching false
+                }
+                Log.i(
+                    TAG,
+                    "Repaired guest context initializer $className for ${session.packageName} " +
+                        "methods=${repairedMethods.distinct().joinToString()} " +
+                        "nullFields=$nullFieldsBefore->$remainingNullFields"
+                )
+                true
+            }.onFailure {
+                Log.d(TAG, "Skipping guest context initializer repair for $className", it)
+            }.getOrDefault(false)
+            if (repaired) {
+                repairedCount += 1
+            }
+            }
+        if (repairedCount > 0) {
+            Log.i(
+                TAG,
+                "Guest context initializer repair complete for ${session.packageName} repaired=$repairedCount"
+            )
+        }
+    }
+
+    private fun repairGuestInterfaceInjectorsIfPresent(
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ) {
+        val candidateClassNames = resolveInterfaceInjectorRepairClassNames(session)
+        if (candidateClassNames.isEmpty()) {
+            return
+        }
+        val loadedClasses = loadInterfaceInjectorRepairClasses(candidateClassNames, session)
+        val implementationsByInterface = buildInterfaceInjectorImplementationsByName(
+            loadedClasses = loadedClasses,
+            application = application
+        )
+        var repairedCount = 0
+        loadedClasses.forEach { holderClass ->
+            val repaired = runCatching {
+                if (holderClass.isInterface || Modifier.isAbstract(holderClass.modifiers)) {
+                    return@runCatching false
+                }
+                val targetField = holderClass.declaredFields.firstOrNull { field ->
+                    Modifier.isStatic(field.modifiers) &&
+                        !Modifier.isFinal(field.modifiers) &&
+                        field.type.isInterface &&
+                        shouldConsiderInterfaceInjectorType(field.type)
+                } ?: return@runCatching false
+                targetField.isAccessible = true
+                if (targetField.get(null) != null) {
+                    return@runCatching false
+                }
+                val interfaceType = targetField.type
+                val implementationClasses = implementationsByInterface[interfaceType.name]
+                    .orEmpty()
+                    .filter { implementation ->
+                        implementation != holderClass &&
+                            findInterfaceInjectorConstructor(implementation, application) != null
+                    }
+                if (implementationClasses.size != 1) {
+                    return@runCatching false
+                }
+                val implementationClass = implementationClasses.single()
+                val implementation = instantiateInterfaceInjector(implementationClass, application)
+                    ?: return@runCatching false
+                holderClass.methods.firstOrNull { method ->
+                    Modifier.isStatic(method.modifiers) &&
+                        method.returnType == Void.TYPE &&
+                        method.parameterTypes.size == 1 &&
+                        method.parameterTypes[0] == interfaceType
+                }?.let { setter ->
+                    setter.isAccessible = true
+                    setter.invoke(null, implementation)
+                } ?: targetField.set(null, implementation)
+                if (targetField.get(null) == null) {
+                    return@runCatching false
+                }
+                Log.i(
+                    TAG,
+                    "Repaired guest interface injector ${holderClass.name} for ${session.packageName} " +
+                        "interface=${interfaceType.name} impl=${implementationClass.name}"
+                )
+                true
+            }.onFailure {
+                Log.d(TAG, "Skipping guest interface injector repair for ${holderClass.name}", it)
+            }.getOrDefault(false)
+            if (repaired) {
+                repairedCount += 1
+            }
+        }
+        if (repairedCount > 0) {
+            Log.i(TAG, "Guest interface injector repair complete for ${session.packageName} repaired=$repairedCount")
+        }
+    }
+
+    private fun resolveAssignableInterfaces(clazz: Class<*>): Set<Class<*>> =
+        buildSet {
+            var current: Class<*>? = clazz
+            while (current != null && current != Any::class.java) {
+                current.interfaces.forEach { interfaceClass ->
+                    add(interfaceClass)
+                    addAll(resolveAssignableInterfaces(interfaceClass))
+                }
+                current = current.superclass
+            }
+        }
+
+    private fun loadInterfaceInjectorRepairClasses(
+        candidateClassNames: List<String>,
+        session: EvokeAppRuntimeSession
+    ): List<Class<*>> =
+        candidateClassNames.mapNotNull { className ->
+            runCatching {
+                session.evokeAppClassLoader.loadClass(className)
+            }.onFailure {
+                Log.v(TAG, "Skipping interface injector candidate $className", it)
+            }.getOrNull()
+        }
+
+    private fun buildInterfaceInjectorImplementationsByName(
+        loadedClasses: List<Class<*>>,
+        application: Application
+    ): Map<String, List<Class<*>>> =
+        loadedClasses
+            .asSequence()
+            .filterNot(Class<*>::isInterface)
+            .filter { !Modifier.isAbstract(it.modifiers) }
+            .flatMap { implementation ->
+                resolveAssignableInterfaces(implementation).asSequence()
+                    .filter(::shouldConsiderInterfaceInjectorType)
+                    .filter { findInterfaceInjectorConstructor(implementation, application) != null }
+                    .map { it.name to implementation }
+            }
+            .groupBy(
+                keySelector = { it.first },
+                valueTransform = { it.second }
+            )
+            .mapValues { (_, implementations) ->
+                implementations.distinctBy(Class<*>::getName)
+            }
+
+    private fun shouldConsiderInterfaceInjectorType(clazz: Class<*>): Boolean {
+        val name = clazz.name
+        return !name.startsWith("android.") &&
+            !name.startsWith("androidx.") &&
+            !name.startsWith("java.") &&
+            !name.startsWith("javax.") &&
+            !name.startsWith("kotlin.") &&
+            !isGuestUiInstantiationType(clazz)
+    }
+
+    private fun findInterfaceInjectorConstructor(
+        clazz: Class<*>,
+        application: Application
+    ): Constructor<*>? =
+        clazz.takeUnless(::isGuestUiInstantiationType)
+            ?.declaredConstructors
+            ?.sortedBy { it.parameterTypes.size }
+            ?.firstOrNull { constructor ->
+                resolveInterfaceInjectorArgs(constructor, application) != null
+            }
+
+    private fun instantiateInterfaceInjector(
+        clazz: Class<*>,
+        application: Application
+    ): Any? {
+        if (isGuestUiInstantiationType(clazz)) {
+            return null
+        }
+        val constructor = findInterfaceInjectorConstructor(clazz, application) ?: return null
+        constructor.isAccessible = true
+        val args = resolveInterfaceInjectorArgs(constructor, application) ?: return null
+        return constructor.newInstance(*args)
+    }
+
+    private fun isGuestUiInstantiationType(clazz: Class<*>): Boolean {
+        val name = clazz.name
+        if (
+            listOf(
+                "android.view.View",
+                "android.app.Activity",
+                "android.app.Dialog",
+                "android.app.Service",
+                "android.content.ContentProvider",
+                "android.app.Fragment",
+                "androidx.fragment.app.Fragment",
+                "androidx.appcompat.app.AppCompatActivity",
+                "androidx.appcompat.app.AppCompatDialog"
+            ).any { parentName ->
+                generateSequence<Class<*>>(clazz) { current ->
+                    current.superclass
+                }.any { current ->
+                    current.name == parentName
+                }
+            }
+        ) {
+            return true
+        }
+        if (
+            clazz.declaredConstructors.any { constructor ->
+                constructor.parameterTypes.any { parameterType ->
+                    parameterType.name == "android.util.AttributeSet"
+                }
+            }
+        ) {
+            return true
+        }
+        return listOf("view", "dialog", "activity", "fragment", "toolbar")
+            .any(name.lowercase()::contains)
+    }
+
+    private fun resolveInterfaceInjectorArgs(
+        constructor: Constructor<*>,
+        application: Application
+    ): Array<Any?>? {
+        val args = constructor.parameterTypes.map { parameterType ->
+            when {
+                parameterType.isInstance(application) -> application
+                parameterType.isInstance(application.applicationContext) -> application.applicationContext
+                parameterType.isAssignableFrom(application.javaClass) -> application
+                parameterType.isAssignableFrom(Application::class.java) -> application
+                parameterType.isAssignableFrom(Context::class.java) -> application.applicationContext
+                parameterType.isAssignableFrom(ContextWrapper::class.java) -> application.applicationContext
+                else -> return null
+            }
+        }
+        return args.toTypedArray()
+    }
+
+    private fun isSupportedGuestContextInitializer(method: Method): Boolean {
+        if (Modifier.isStatic(method.modifiers) || method.returnType != Void.TYPE) {
+            return false
+        }
+        if (method.parameterTypes.isEmpty() || method.parameterTypes.size > 2) {
+            return false
+        }
+        val ownerName = method.declaringClass.name
+        val methodName = method.name
+        val ownerLooksObfuscated =
+            INTERFACE_INJECTOR_OBFUSCATED_CLASS_NAME.matches(ownerName) ||
+                CONTEXT_SINGLETON_OBFUSCATED_CLASS_NAME.matches(ownerName) ||
+                THEME_WRAPPER_OBFUSCATED_CLASS_NAME.matches(ownerName)
+        val methodLooksObfuscated =
+            methodName.length <= 2 && methodName.all { it.isLetterOrDigit() }
+        if (
+            methodName !in GUEST_CONTEXT_INITIALIZER_METHOD_NAMES &&
+            !(ownerLooksObfuscated && methodLooksObfuscated)
+        ) {
+            return false
+        }
+        return method.parameterTypes.none { parameterType ->
+            parameterType.isPrimitive &&
+                parameterType != Boolean::class.javaPrimitiveType
+        }
+    }
+
+    private fun resolveGuestContextInitializerArgs(
+        method: Method,
+        application: Application,
+        implementationsByInterface: Map<String, List<Class<*>>>
+    ): Array<Any?>? {
+        val args = method.parameterTypes.map { parameterType ->
+            when {
+                parameterType.isInstance(application) -> application
+                parameterType.isInstance(application.applicationContext) -> application.applicationContext
+                parameterType.isAssignableFrom(application.javaClass) -> application
+                parameterType.isAssignableFrom(Application::class.java) -> application
+                parameterType.isAssignableFrom(Context::class.java) -> application.applicationContext
+                parameterType.isAssignableFrom(ContextWrapper::class.java) -> application.applicationContext
+                parameterType.isInterface && shouldConsiderInterfaceInjectorType(parameterType) ->
+                    resolveGuestContextInitializerInterfaceArg(
+                        interfaceType = parameterType,
+                        implementationsByInterface = implementationsByInterface,
+                        application = application
+                    ) ?: return null
+                parameterType.isEnum && parameterType.enumConstants?.size == 1 ->
+                    parameterType.enumConstants?.firstOrNull()
+                !parameterType.isPrimitive && shouldConsiderGuestRepairableFieldType(parameterType) ->
+                    resolveGuestContextInitializerInstance(parameterType)
+                        ?: instantiateInterfaceInjector(parameterType, application)
+                else -> return null
+            }
+        }
+        return args.toTypedArray()
+    }
+
+    private fun resolveGuestContextInitializerInterfaceArg(
+        interfaceType: Class<*>,
+        implementationsByInterface: Map<String, List<Class<*>>>,
+        application: Application
+    ): Any? {
+        val implementationClass = implementationsByInterface[interfaceType.name]
+            .orEmpty()
+            .singleOrNull()
+            ?: return null
+        return instantiateInterfaceInjector(implementationClass, application)
+    }
+
+    private fun isGuestContextLikeType(type: Class<*>): Boolean =
+        type.isAssignableFrom(Application::class.java) ||
+            type.isAssignableFrom(Context::class.java) ||
+            type.isAssignableFrom(ContextWrapper::class.java)
+
+    private fun resolveGuestContextInitializerInstance(clazz: Class<*>): Any? {
+        resolveSingletonRepairInstance(clazz)?.let { return it }
+        clazz.declaredFields.firstOrNull { field ->
+            Modifier.isStatic(field.modifiers) &&
+                !field.type.isPrimitive &&
+                (clazz.isAssignableFrom(field.type) || field.type.isInterface)
+        }?.let { field ->
+            field.isAccessible = true
+            field.get(null)?.takeIf(clazz::isInstance)?.let { return it }
+        }
+        clazz.methods
+            .asSequence()
+            .filter { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.parameterTypes.isEmpty() &&
+                    method.returnType != Void.TYPE &&
+                    !method.returnType.isPrimitive &&
+                    (
+                        method.returnType == clazz ||
+                            clazz.isAssignableFrom(method.returnType) ||
+                            method.returnType.isInterface
+                        )
+            }
+            .forEach { method ->
+                runCatching {
+                    method.isAccessible = true
+                    method.invoke(null)
+                }.getOrNull()?.takeIf(clazz::isInstance)?.let { return it }
+            }
+        return null
+    }
+
+    private fun countGuestRepairableNullFields(instance: Any): Int =
+        countGuestRepairableNullFields(instance.javaClass, instance)
+
+    private fun countGuestRepairableNullFields(
+        holderClass: Class<*>,
+        instance: Any
+    ): Int =
+        countGuestRepairableStaticNullFields(holderClass) +
+        generateSequence(instance.javaClass) { it.superclass }
+            .takeWhile { it != Any::class.java }
+            .flatMap { it.declaredFields.asSequence() }
+            .count { field ->
+                !Modifier.isStatic(field.modifiers) &&
+                    !field.type.isPrimitive &&
+                    shouldConsiderGuestRepairableFieldType(field.type).also {
+                        if (it) {
+                            field.isAccessible = true
+                        }
+                    } &&
+                    field.get(instance) == null
+            }
+
+    private fun countGuestRepairableStaticNullFields(clazz: Class<*>): Int =
+        generateSequence(clazz) { it.superclass }
+            .takeWhile { it != Any::class.java }
+            .flatMap { it.declaredFields.asSequence() }
+            .count { field ->
+                Modifier.isStatic(field.modifiers) &&
+                    !field.type.isPrimitive &&
+                    shouldConsiderGuestRepairableFieldType(field.type).also {
+                        if (it) {
+                            field.isAccessible = true
+                        }
+                    } &&
+                    field.get(null) == null
+            }
+
+    private fun shouldConsiderGuestRepairableFieldType(type: Class<*>): Boolean {
+        val name = type.name
+        return !type.isPrimitive &&
+            !name.startsWith("android.") &&
+            !name.startsWith("androidx.") &&
+            !name.startsWith("java.") &&
+            !name.startsWith("javax.") &&
+            !name.startsWith("kotlin.") &&
+            !isGuestUiInstantiationType(type)
+    }
+
+    private fun resolveInterfaceInjectorRepairClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        interfaceInjectorRepairClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
+            }
+        ) {
+            val packagePrefixes = resolveStartupBridgePackagePrefixes(session)
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    '$' !in className &&
+                        (
+                            packagePrefixes.any { prefix -> className.startsWith("$prefix.") } ||
+                                INTERFACE_INJECTOR_OBFUSCATED_CLASS_NAME.matches(className)
+                            )
+                }
+                .toList()
+        }
+
+    private fun resolveThemeWrapperRepairClassNames(
+        session: EvokeAppRuntimeSession
+    ): List<String> =
+        themeWrapperRepairClassCache.getOrPut(
+            buildString {
+                append(session.apkPath)
+                session.splitApkPaths.forEach {
+                    append('|')
+                    append(it)
+                }
+            }
+        ) {
+            val packagePrefixes = resolveStartupBridgePackagePrefixes(session)
+            sequenceOf(session.apkPath)
+                .plus(session.splitApkPaths.asSequence())
+                .flatMap(::enumerateArchiveClassNames)
+                .filter { className ->
+                    '$' !in className &&
+                        (
+                            packagePrefixes.any { prefix -> className.startsWith("$prefix.") } ||
+                                THEME_WRAPPER_OBFUSCATED_CLASS_NAME.matches(className)
+                            )
+                }
+                .toList()
+        }
+
+    private fun instantiateStartupBridge(
+        className: String,
+        application: Application,
+        session: EvokeAppRuntimeSession
+    ): Any? =
+        runCatching {
+            val clazz = session.evokeAppClassLoader.loadClass(className)
+            if (Modifier.isAbstract(clazz.modifiers) || clazz.isInterface) {
+                return null
+            }
+            clazz.declaredFields.firstOrNull { field ->
+                Modifier.isStatic(field.modifiers) &&
+                    field.name == "INSTANCE" &&
+                    clazz.isAssignableFrom(field.type)
+            }?.let { field ->
+                field.isAccessible = true
+                field.get(null)?.let { return it }
+            }
+            clazz.declaredConstructors
+                .sortedBy { it.parameterTypes.size }
+                .firstNotNullOfOrNull { constructor ->
+                    instantiateStartupBridgeViaConstructor(constructor, application)
+                }
+        }.onFailure {
+            Log.d(TAG, "Skipping startup bridge instance $className for ${session.packageName}", it)
+        }.getOrNull()
+
+    private fun instantiateStartupBridgeViaConstructor(
+        constructor: Constructor<*>,
+        application: Application
+    ): Any? {
+        constructor.isAccessible = true
+        val args = constructor.parameterTypes.map { parameterType ->
+            when {
+                parameterType.isInstance(application) -> application
+                parameterType.isInstance(application.applicationContext) -> application.applicationContext
+                parameterType.isAssignableFrom(application.javaClass) -> application
+                parameterType.isAssignableFrom(Application::class.java) -> application
+                parameterType.isAssignableFrom(Context::class.java) -> application.applicationContext
+                parameterType.isAssignableFrom(ContextWrapper::class.java) -> application.applicationContext
+                else -> return null
+            }
+        }
+        return constructor.newInstance(*args.toTypedArray())
+    }
+
+    private fun shouldDispatchStartupOnLaunch(startup: Any): Boolean =
+        runCatching {
+            val method = startup.javaClass.methods.firstOrNull { candidate ->
+                candidate.name == "callCreateOnMainThread" &&
+                    candidate.parameterTypes.isEmpty() &&
+                    (candidate.returnType == Boolean::class.javaPrimitiveType ||
+                        candidate.returnType == Boolean::class.javaObjectType)
+            } ?: return@runCatching true
+            method.invoke(startup) as? Boolean ?: true
+        }.getOrElse {
+            Log.d(TAG, "Unable to inspect callCreateOnMainThread for ${startup.javaClass.name}", it)
+            true
+        }
+
+    private fun executeStartupBridgeRecursively(
+        className: String,
+        startup: Any,
+        startupBaseClass: Class<*>,
+        application: Application,
+        startupContext: Context,
+        session: EvokeAppRuntimeSession,
+        startupInstances: MutableMap<String, Any>,
+        visiting: MutableSet<String>,
+        executed: MutableSet<String>
+    ) {
+        if (executed.contains(className)) {
+            return
+        }
+        if (!visiting.add(className)) {
+            Log.w(TAG, "Detected startup bridge cycle at $className for ${session.packageName}")
+            return
+        }
+        resolveStartupBridgeDependencies(startup).forEach { dependencyClassName ->
+            val dependency = startupInstances[dependencyClassName]
+                ?: instantiateStartupBridge(
+                    className = dependencyClassName,
+                    application = application,
+                    session = session
+                )?.also { startupInstances[dependencyClassName] = it }
+            if (dependency == null || !startupBaseClass.isInstance(dependency)) {
+                return@forEach
+            }
+            executeStartupBridgeRecursively(
+                className = dependencyClassName,
+                startup = dependency,
+                startupBaseClass = startupBaseClass,
+                application = application,
+                startupContext = startupContext,
+                session = session,
+                startupInstances = startupInstances,
+                visiting = visiting,
+                executed = executed
+            )
+        }
+        visiting.remove(className)
+        runCatching {
+            val createMethod = startup.javaClass.methods.firstOrNull { method ->
+                method.name == "create" &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0].isAssignableFrom(Context::class.java)
+            } ?: startup.javaClass.methods.firstOrNull { method ->
+                method.name in STARTUP_BRIDGE_CREATE_METHODS &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0].isAssignableFrom(Context::class.java)
+            } ?: return@runCatching
+            createMethod.isAccessible = true
+            createMethod.invoke(startup, startupContext)
+            executed += className
+            Log.i(TAG, "Executed startup bridge $className for ${session.packageName}")
+        }.onFailure {
+            Log.w(TAG, "Unable to execute startup bridge $className for ${session.packageName}", it)
+        }
+    }
+
+    private fun resolveStartupBridgeDependencies(startup: Any): List<String> {
+        val dependenciesByName = runCatching {
+            startup.javaClass.methods.firstOrNull { method ->
+                method.name == "dependenciesByName" && method.parameterTypes.isEmpty()
+            }?.invoke(startup) as? Iterable<*>
+        }.getOrNull()
+            ?.mapNotNull { it as? String }
+            .orEmpty()
+        if (dependenciesByName.isNotEmpty()) {
+            return dependenciesByName
+        }
+        return runCatching {
+            startup.javaClass.methods.firstOrNull { method ->
+                method.name == "dependencies" && method.parameterTypes.isEmpty()
+            }?.invoke(startup) as? Iterable<*>
+        }.getOrNull()
+            ?.mapNotNull { dependency ->
+                when (dependency) {
+                    is Class<*> -> dependency.name
+                    else -> null
+                }
+            }
+            .orEmpty()
+    }
+
+    private fun initializeMmkvIfPresent(
         context: Context,
         session: EvokeAppRuntimeSession
     ) {
         runCatching {
-            val classLoader = session.evokeAppClassLoader
-            val firebaseAppClass = classLoader.loadClass("eh.f")
-            val crashlyticsClass = classLoader.loadClass("lh.f")
-            val firebaseApp = firebaseAppClass.getMethod("c").invoke(null) ?: return@runCatching
-            val existingCrashlytics = firebaseAppClass
-                .getMethod("b", Class::class.java)
-                .invoke(firebaseApp, crashlyticsClass)
-            if (existingCrashlytics != null) {
-                Log.i(TAG, "Firebase component runtime already exposes Crashlytics for ${session.packageName}")
+            val mmkvClass = session.evokeAppClassLoader.loadClass("com.tencent.mmkv.MMKV")
+            val existingRoot = mmkvClass.methods.firstOrNull { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.name == "rootDir" &&
+                    method.parameterTypes.isEmpty()
+            }?.invoke(null) as? String
+            if (!existingRoot.isNullOrBlank()) {
+                Log.i(TAG, "MMKV already initialized for ${session.packageName} root=$existingRoot")
                 return@runCatching
             }
-            val registrarClassNames = resolveFirebaseRegistrarClassNames(context, session)
-            if (registrarClassNames.isEmpty()) {
-                Log.w(TAG, "No Firebase registrars discovered for ${session.packageName}")
-                return@runCatching
+            val initMethod = mmkvClass.methods.firstOrNull { method ->
+                Modifier.isStatic(method.modifiers) &&
+                    method.name == "initialize" &&
+                    method.parameterTypes.firstOrNull()?.let(Context::class.java::isAssignableFrom) == true
+            } ?: return@runCatching
+            val mmkvDir = File(context.filesDir, "mmkv").apply { mkdirs() }
+            val initArgs = when {
+                initMethod.parameterTypes.size == 1 -> arrayOf(context)
+                initMethod.parameterTypes.size >= 2 &&
+                    initMethod.parameterTypes[1] == String::class.java -> {
+                    arrayOf(context, mmkvDir.absolutePath)
+                }
+                else -> return@runCatching
             }
-            val hiBClass = classLoader.loadClass("hi.b")
-            val providers = arrayListOf<Any>()
-            registrarClassNames.forEach { registrarClassName ->
-                providers += newProviderProxy(classLoader, hiBClass, registrarClassName)
-            }
-            providers += newProviderProxy(classLoader, hiBClass, "com.google.firebase.FirebaseCommonRegistrar")
-            providers += newProviderProxy(classLoader, hiBClass, "com.google.firebase.concurrent.ExecutorsRegistrar")
-            val components = arrayListOf<Any>()
-            val componentClass = classLoader.loadClass("jh.b")
-            val addComponent = componentClass.methods.first {
-                it.name == "c" &&
-                    it.parameterTypes.size == 3 &&
-                    it.parameterTypes[0] == Any::class.java &&
-                    it.parameterTypes[1] == Class::class.java &&
-                    it.parameterTypes[2].isArray
-            }
-            val emptyInterfaces = emptyArray<Class<*>>()
-            val firebaseOptions = firebaseAppClass.getDeclaredField("f25570c").apply {
-                isAccessible = true
-            }.get(firebaseApp)
-            components += addComponent.invoke(null, context, Context::class.java, emptyInterfaces)
-            components += addComponent.invoke(null, firebaseApp, firebaseAppClass, emptyInterfaces)
-            components += addComponent.invoke(
-                null,
-                firebaseOptions,
-                classLoader.loadClass("eh.k"),
-                emptyInterfaces
-            )
-            runCatching {
-                val firebaseInitProviderClass = classLoader.loadClass("com.google.firebase.provider.FirebaseInitProvider")
-                val directBootSupport = firebaseInitProviderClass.getDeclaredField("f18952b").apply {
-                    isAccessible = true
-                }.get(null)
-                components += addComponent.invoke(
-                    null,
-                    directBootSupport,
-                    classLoader.loadClass("eh.l"),
-                    emptyInterfaces
-                )
-            }.onFailure {
-                Log.d(TAG, "Skipping Firebase direct-boot component for ${session.packageName}", it)
-            }
-            val executor = classLoader.loadClass("kh.z").getDeclaredField("f29706b").apply {
-                isAccessible = true
-            }.get(null) as Executor
-            val componentMonitor = classLoader.loadClass("ri.b").getDeclaredConstructor().newInstance()
-            val runtimeClass = classLoader.loadClass("jh.l")
-            val componentRuntime = runtimeClass.constructors.first {
-                it.parameterTypes.size == 4
-            }.newInstance(executor, ArrayList(providers), ArrayList(components), componentMonitor)
-            firebaseAppClass.getDeclaredField("f25571d").apply {
-                isAccessible = true
-                set(firebaseApp, componentRuntime)
-            }
-            val heartbeatProvider = runtimeClass
-                .getMethod("b", Class::class.java)
-                .invoke(componentRuntime, classLoader.loadClass("ei.f"))
-            firebaseAppClass.getDeclaredField("f25575h").apply {
-                isAccessible = true
-                set(firebaseApp, heartbeatProvider)
-            }
-            firebaseAppClass.getMethod("e").invoke(firebaseApp)
-            val repairedCrashlytics = firebaseAppClass
-                .getMethod("b", Class::class.java)
-                .invoke(firebaseApp, crashlyticsClass)
+            val rootDir = initMethod.invoke(null, *initArgs) as? String
             Log.i(
                 TAG,
-                "Firebase component runtime repaired for ${session.packageName} " +
-                    "registrars=${registrarClassNames.size} crashlyticsReady=${repairedCrashlytics != null}"
+                "Initialized MMKV for ${session.packageName} root=${rootDir ?: mmkvDir.absolutePath}"
             )
         }.onFailure {
-            Log.w(TAG, "Unable to repair Firebase component runtime for ${session.packageName}", it)
+            Log.d(TAG, "MMKV eager initialization skipped for ${session.packageName}", it)
         }
     }
 
-    private fun newProviderProxy(
-        classLoader: ClassLoader,
-        hiBClass: Class<*>,
-        registrarClassName: String
-    ): Any =
-        Proxy.newProxyInstance(classLoader, arrayOf(hiBClass)) { _, method, _ ->
-            when (method.name) {
-                "get" -> classLoader.loadClass(registrarClassName).getDeclaredConstructor().newInstance()
-                "toString" -> "RegistrarProvider($registrarClassName)"
-                "hashCode" -> registrarClassName.hashCode()
-                "equals" -> false
-                else -> null
-            }
-        }
-
-    private fun resolveFirebaseRegistrarClassNames(
-        context: Context,
-        session: EvokeAppRuntimeSession
-    ): List<String> {
-        val flags = PackageManager.PackageInfoFlags.of(
-            PackageManager.GET_SERVICES.toLong() or PackageManager.GET_META_DATA.toLong()
-        )
-        val archiveInfo = context.packageManager.getPackageArchiveInfo(session.apkPath, flags)
-        val discoveryService = archiveInfo
-            ?.services
-            ?.firstOrNull { it.name == "com.google.firebase.components.ComponentDiscoveryService" }
-        return discoveryService
-            ?.metaData
-            ?.keySet()
-            ?.filter { key ->
-                key.startsWith("com.google.firebase.components:") &&
-                    discoveryService.metaData?.get(key) == "com.google.firebase.components.ComponentRegistrar"
-            }
-            ?.map { it.removePrefix("com.google.firebase.components:") }
-            .orEmpty()
-            .distinct()
-            .also {
-                Log.i(
-                    TAG,
-                    "Resolved Firebase registrars for ${session.packageName}: ${it.joinToString()}"
-                )
-            }
-    }
 }
 
 data class RuntimeBootstrapResult(
